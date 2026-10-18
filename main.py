@@ -166,9 +166,9 @@ async def get_instruction_msg():
         "✅ <b>Доступ открыт. Добро пожаловать в «Историю»!</b>\n\n"
         "<b>Бот не подключён</b>\n"
         "После подключения покажет удаленные и отредактированные сообщения.\n"
-        "Для сохранения сгорающих — ответьте на него любым сообщением.\n\n"
+        "Для сохранения сгорающих или однократных — ответьте на них любым сообщением.\n\n"
         "• Бот присылает уведомления, когда собеседник удаляет или редактирует сообщения.\n"
-        "• Может сохранять сгорающие фото, голосовые и видео."
+        "• Может сохранять сгорающие и однократные фото, голосовые и видео."
     )
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -336,6 +336,8 @@ async def on_business_message(msg: types.Message):
             media_type, media_file_id = "photo", target_msg.photo[-1].file_id
         elif target_msg.video:
             media_type, media_file_id = "video", target_msg.video.file_id
+        elif target_msg.animation:
+            media_type, media_file_id = "animation", target_msg.animation.file_id
             
         supabase.table("messages").upsert({
             "connection_id": msg.business_connection_id, "chat_id": target_msg.chat.id,
@@ -348,20 +350,20 @@ async def on_business_message(msg: types.Message):
             "sent_at": target_msg.date.isoformat() if target_msg.date else None,
         }, on_conflict="connection_id,chat_id,message_id").execute()
         
-        if media_file_id and media_type in ("photo", "video"):
+        if media_file_id and media_type in ("photo", "video", "animation"):
             try:
                 file = await bot.get_file(media_file_id)
                 if file.file_size and file.file_size <= 20 * 1024 * 1024:
                     buf = BytesIO()
                     await bot.download_file(file.file_path, buf)
-                    file_bytes = buf.getvalue() # Сохраняем байты для отправки
+                    file_bytes = buf.getvalue()
                     
                     path = f"{owner_id}/{msg.business_connection_id}/{target_msg.chat.id}/{target_msg.message_id}.{media_type}"
                     
                     supabase.storage.from_(STORAGE_BUCKET).upload(
                         path, file_bytes,
                         file_options={
-                            "content-type": "image/jpeg" if media_type == "photo" else "video/mp4",
+                            "content-type": "image/jpeg" if media_type == "photo" else ("video/mp4" if media_type == "video" else "video/mp4"),
                             "upsert": "true"
                         }
                     )
@@ -372,17 +374,28 @@ async def on_business_message(msg: types.Message):
                             "media_type": media_type, "storage_path": path, "file_size": file.file_size,
                         }, on_conflict="message_id").execute()
 
-                    # Отправляем скачанный файл (байты) обратно в чат, чтобы обойти ограничения TTL
+                    # Отправляем скачанный файл (байты) обратно в чат, если это был ответ
                     if target_msg.message_id != msg.message_id:
                         try:
+                            # Проверяем, является ли медиа однократным или исчезающим
+                            is_spoiler = getattr(target_msg, 'has_media_spoiler', False)
+                            is_ttl = getattr(target_msg, 'ttl_seconds', None) is not None
+                            
                             if media_type == "photo":
+                                prefix = "📸 Сохранено "
+                                prefix += "однократное фото" if is_spoiler else ("исчезающее фото" if is_ttl else "фото")
                                 input_file = types.BufferedInputFile(file_bytes, filename="photo.jpg")
-                                await bot.send_photo(owner_id, input_file, caption="📸 Сохранено исчезающее фото")
+                                await bot.send_photo(owner_id, input_file, caption=prefix)
                             elif media_type == "video":
+                                prefix = "🎬 Сохранено "
+                                prefix += "однократное видео" if is_spoiler else ("исчезающее видео" if is_ttl else "видео")
                                 input_file = types.BufferedInputFile(file_bytes, filename="video.mp4")
-                                await bot.send_video(owner_id, input_file, caption="🎬 Сохранено исчезающее видео")
+                                await bot.send_video(owner_id, input_file, caption=prefix)
+                            elif media_type == "animation":
+                                input_file = types.BufferedInputFile(file_bytes, filename="animation.mp4")
+                                await bot.send_animation(owner_id, input_file, caption="🎬 Сохранена GIF-анимация")
                         except Exception as send_err:
-                            logger.warning(f"Could not send TTL media back to owner: {send_err}")
+                            logger.warning(f"Could not send TTL/Spoiler media back to owner: {send_err}")
             except Exception as e:
                 logger.warning(f"media save failed: {e}")
 
