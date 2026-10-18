@@ -181,6 +181,30 @@ def is_user_active(user_id: int) -> bool:
             pass
     return True
 
+# ── ДОБАВЛЕНО: Фоновая задача для проверки сроков ──────────────────────────
+async def check_expirations():
+    while True:
+        try:
+            now_iso = now_utc().isoformat()
+            # Ищем тех, у кого истек срок и еще не отправлено уведомление
+            res = supabase.table("users").select("id").lt("valid_until", now_iso).or_("expiry_notified.eq.false,expiry_notified.is.null").execute()
+            
+            if res.data:
+                for u in res.data:
+                    uid = u["id"]
+                    try:
+                        await bot.send_message(uid, "⏳ <b>Срок действия вашего доступа истек.</b>\nДля продления обратитесь к администратору: @GaspardShop")
+                        supabase.table("users").update({"expiry_notified": True, "status": "denied"}).eq("id", uid).execute()
+                    except Exception as e:
+                        logger.warning(f"Could not send expiry message to {uid}: {e}")
+                        # Если заблокировали бота, все равно ставим флаг
+                        supabase.table("users").update({"expiry_notified": True, "status": "denied"}).eq("id", uid).execute()
+        except Exception as e:
+            logger.error(f"Error in check_expirations: {e}")
+            
+        await asyncio.sleep(300) # Проверка каждые 5 минут
+# ────────────────────────────────────────────────────────────────────────────
+
 def upsert_chat(connection_id: str, chat: types.Chat, owner_id: int):
     supabase.table("chats").upsert({
         "connection_id": connection_id, "chat_id": chat.id, "chat_type": str(chat.type),
@@ -309,6 +333,14 @@ async def cb_admin_deny(cq: CallbackQuery):
     uid = int(cq.data.split(":")[1])
     supabase.table("users").update({"status": "blocked"}).eq("id", uid).execute()
     await safe_answer(cq, "Пользователь заблокирован", show_alert=True)
+    
+    # --- ДОБАВЛЕНО: Уведомление пользователю при ручной блокировке ---
+    try:
+        await bot.send_message(uid, "🔒 <b>Доступ заблокирован.</b>\nСвяжитесь с администратором для восстановления: @GaspardShop")
+    except Exception as e:
+        logger.warning(f"Could not send block notify: {e}")
+    # ------------------------------------------------------------------
+    
     await cb_admin_user_card(cq)
 
 # ── Установка срока ─────────────────────────────────────────────────────────
@@ -350,11 +382,12 @@ async def cb_term_set(cq: CallbackQuery):
         valid_until = (now_utc() + timedelta(days=days)).isoformat()
         
     if target_type == "user":
-        supabase.table("users").update({"status": "approved", "valid_until": valid_until}).eq("id", target_id).execute()
+        # Сбрасываем флаг expiry_notified, если мы выдали новый срок
+        supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", target_id).execute()
     else:
         req = fetch_one(supabase.table("access_requests").select("user_id").eq("id", target_id))
         if req:
-            supabase.table("users").update({"status": "approved", "valid_until": valid_until}).eq("id", req["user_id"]).execute()
+            supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", req["user_id"]).execute()
             supabase.table("access_requests").update({"status": "approved", "resolved_at": now_utc().isoformat()}).eq("id", target_id).execute()
             text, kb = await get_instruction_msg()
             try: await bot.send_message(req["user_id"], text, reply_markup=kb)
@@ -395,12 +428,12 @@ async def process_custom_date(message: types.Message, state: FSMContext):
     await state.clear()
     
     if target_type == "user":
-        supabase.table("users").update({"status": "approved", "valid_until": valid_until}).eq("id", target_id).execute()
+        supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", target_id).execute()
         await message.answer(f"✅ Срок установлен до: {fmt_dt(valid_until)}")
     else:
         req = fetch_one(supabase.table("access_requests").select("user_id").eq("id", target_id))
         if req:
-            supabase.table("users").update({"status": "approved", "valid_until": valid_until}).eq("id", req["user_id"]).execute()
+            supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", req["user_id"]).execute()
             supabase.table("access_requests").update({"status": "approved", "resolved_at": now_utc().isoformat()}).eq("id", target_id).execute()
             text, kb = await get_instruction_msg()
             try: await bot.send_message(req["user_id"], text, reply_markup=kb)
@@ -805,6 +838,11 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
 # ── FastAPI ──────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="История API")
+
+# ДОБАВЛЕНО: Запуск фоновой задачи при старте сервера
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(check_expirations())
 
 @app.post("/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
