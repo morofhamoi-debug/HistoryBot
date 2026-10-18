@@ -191,7 +191,6 @@ async def get_instruction_msg():
         "• Может сохранять сгорающие фото, голосовые и видео."
     )
     
-    # Кнопка copy_text доступна в aiogram 3.7+ (Bot API 7.0)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
@@ -325,12 +324,34 @@ async def cb_deny(cq: CallbackQuery):
 
 @dp.business_connection()
 async def on_business_connection(conn: types.BusinessConnection):
+    # Сохраняем или обновляем подключение в базе
     supabase.table("business_connections").upsert({
         "id": conn.id,
         "owner_id": conn.user.id,
         "is_enabled": conn.is_enabled,
         "updated_at": now_utc().isoformat(),
     }, on_conflict="id").execute()
+
+    # Отправляем уведомление пользователю
+    if conn.is_enabled:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📱 Открыть Историю", web_app=types.WebAppInfo(url=MINI_APP_URL))]
+        ])
+        text = (
+            "✅ <b>Бот успешно подключён к автоматизации чатов!</b>\n\n"
+            "Теперь я буду сохранять историю сообщений и присылать уведомления, "
+            "если собеседник удалит или изменит сообщение.\n\n"
+            "Все сохранённые данные доступны в приложении «История»."
+        )
+        try:
+            await bot.send_message(conn.user.id, text, reply_markup=kb)
+        except Exception as e:
+            logger.error(f"Failed to send business connection notify: {e}")
+    else:
+        try:
+            await bot.send_message(conn.user.id, "⚠️ <b>Бот отключён от автоматизации чатов.</b>\nУведомления об удалённых сообщениях больше не будут приходить.")
+        except Exception as e:
+            logger.error(f"Failed to send business disconnect notify: {e}")
 
 @dp.business_message()
 async def on_business_message(msg: types.Message):
