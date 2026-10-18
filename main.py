@@ -354,10 +354,12 @@ async def on_business_message(msg: types.Message):
                 if file.file_size and file.file_size <= 20 * 1024 * 1024:
                     buf = BytesIO()
                     await bot.download_file(file.file_path, buf)
+                    file_bytes = buf.getvalue() # Сохраняем байты для отправки
+                    
                     path = f"{owner_id}/{msg.business_connection_id}/{target_msg.chat.id}/{target_msg.message_id}.{media_type}"
                     
                     supabase.storage.from_(STORAGE_BUCKET).upload(
-                        path, buf.getvalue(),
+                        path, file_bytes,
                         file_options={
                             "content-type": "image/jpeg" if media_type == "photo" else "video/mp4",
                             "upsert": "true"
@@ -370,14 +372,17 @@ async def on_business_message(msg: types.Message):
                             "media_type": media_type, "storage_path": path, "file_size": file.file_size,
                         }, on_conflict="message_id").execute()
 
+                    # Отправляем скачанный файл (байты) обратно в чат, чтобы обойти ограничения TTL
                     if target_msg.message_id != msg.message_id:
                         try:
                             if media_type == "photo":
-                                await bot.send_photo(owner_id, media_file_id, caption="📸 Сохранено исчезающее фото")
+                                input_file = types.BufferedInputFile(file_bytes, filename="photo.jpg")
+                                await bot.send_photo(owner_id, input_file, caption="📸 Сохранено исчезающее фото")
                             elif media_type == "video":
-                                await bot.send_video(owner_id, media_file_id, caption="🎬 Сохранено исчезающее видео")
-                        except Exception as e:
-                            logger.warning(f"Could not send TTL media back to owner: {e}")
+                                input_file = types.BufferedInputFile(file_bytes, filename="video.mp4")
+                                await bot.send_video(owner_id, input_file, caption="🎬 Сохранено исчезающее видео")
+                        except Exception as send_err:
+                            logger.warning(f"Could not send TTL media back to owner: {send_err}")
             except Exception as e:
                 logger.warning(f"media save failed: {e}")
 
@@ -424,7 +429,6 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
         if row:
             m = row
             sent = fmt_dt(m.get("sent_at"))
-            # Используем blockquote для цитаты
             parts.append(
                 f"👤 Отправитель: {m.get('sender_name') or 'Неизвестно'}\n"
                 f"🔗 Username: {m.get('sender_username') or 'Не указан'}\n"
