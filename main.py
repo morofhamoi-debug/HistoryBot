@@ -324,8 +324,12 @@ async def on_business_message(msg: types.Message):
     upsert_chat(msg.business_connection_id, msg.chat, owner_id)
     upsert_contact(owner_id, msg.chat)
 
+    # Проверяем, является ли сообщение ответом на другое
+    is_reply = bool(msg.reply_to_message)
+    
+    # Список сообщений для обработки
     messages_to_process = [msg]
-    if msg.reply_to_message:
+    if is_reply:
         messages_to_process.append(msg.reply_to_message)
 
     for target_msg in messages_to_process:
@@ -346,70 +350,97 @@ async def on_business_message(msg: types.Message):
         is_spoiler = getattr(target_msg, 'has_media_spoiler', False)
         is_ttl = getattr(target_msg, 'ttl_seconds', None) is not None
         is_ephemeral = is_spoiler or is_ttl
-        
-        # Если это ИСХОДЯЩЕЕ сообщение и содержит медиа (фото/видео/гиф) — ИГНОРИРУЕМ
+
+        # Игнорируем исходящие медиа
         if is_outgoing and media_type:
             continue
+
+        # Ищем запись в БД (если это ответ на сообщение)
+        db_msg = None
+        if target_msg.message_id != msg.message_id:
+            db_msg = fetch_one(supabase.table("messages").select("id, media_file_id").eq("connection_id", msg.business_connection_id).eq("chat_id", target_msg.chat.id).eq("message_id", target_msg.message_id))
+        
+        # ЛОГИКА ФИЛЬТРАЦИИ
+        if target_msg.message_id != msg.message_id:
+            # Это ответ на сообщение (reply_to_message)
+            # Мы разрешаем, если у самого сообщения есть флаги TTL/Spoiler, 
+            # ИЛИ если в БД мы ранее сохранили его с меткой EPHEMERAL
+            was_ephemeral = db_msg and db_msg.get("media_file_id") == "EPHEMERAL"
             
-        # Сохраняем в БД
-        supabase.table("messages").upsert({
+            if media_type and not is_ephemeral and not was_ephemeral:
+                # Это обычное фото, на которое ответили. Игнорируем.
+                continue
+        else:
+            # Это новое сообщение (не ответ)
+            if media_type and not is_ephemeral:
+                # Обычное фото без ответа. Игнорируем.
+                continue
+
+        # Сохраняем/обновляем в БД
+        payload = {
             "connection_id": msg.business_connection_id, "chat_id": target_msg.chat.id,
             "message_id": target_msg.message_id, "owner_id": owner_id,
             "sender_id": sender_id,
             "sender_name": sender.full_name if sender else None,
             "sender_username": sender.username if sender else None,
             "text": target_msg.text or target_msg.caption,
-            "media_type": media_type, "media_file_id": media_file_id,
+            "media_type": media_type, 
+            "media_file_id": media_file_id if not is_ephemeral else "EPHEMERAL",
             "sent_at": target_msg.date.isoformat() if target_msg.date else None,
-        }, on_conflict="connection_id,chat_id,message_id").execute()
+        }
+        supabase.table("messages").upsert(payload, on_conflict="connection_id,chat_id,message_id").execute()
         
-        # Скачиваем медиа, если есть file_id
+        # Скачиваем медиа, если есть file_id и это эфемерное (или ответ на эфемерное)
         if media_file_id and media_type in ("photo", "video", "animation"):
-            try:
-                file = await bot.get_file(media_file_id)
-                if file.file_size and file.file_size <= 20 * 1024 * 1024:
-                    buf = BytesIO()
-                    await bot.download_file(file.file_path, buf)
-                    file_bytes = buf.getvalue()
-                    
-                    path = f"{owner_id}/{msg.business_connection_id}/{target_msg.chat.id}/{target_msg.message_id}.{media_type}"
-                    
-                    supabase.storage.from_(STORAGE_BUCKET).upload(
-                        path, file_bytes,
-                        file_options={
-                            "content-type": "image/jpeg" if media_type == "photo" else ("video/mp4" if media_type == "video" else "video/mp4"),
-                            "upsert": "true"
-                        }
-                    )
-                    mid_row = fetch_one(supabase.table("messages").select("id").eq("connection_id", msg.business_connection_id).eq("chat_id", target_msg.chat.id).eq("message_id", target_msg.message_id))
-                    if mid_row:
-                        supabase.table("media_files").upsert({
-                            "message_id": mid_row["id"], "owner_id": owner_id,
-                            "media_type": media_type, "storage_path": path, "file_size": file.file_size,
-                        }, on_conflict="message_id").execute()
+            if is_ephemeral or (target_msg.message_id != msg.message_id and db_msg and db_msg.get("media_file_id") == "EPHEMERAL"):
+                try:
+                    file = await bot.get_file(media_file_id)
+                    if file.file_size and file.file_size <= 20 * 1024 * 1024:
+                        buf = BytesIO()
+                        await bot.download_file(file.file_path, buf)
+                        file_bytes = buf.getvalue()
+                        
+                        path = f"{owner_id}/{msg.business_connection_id}/{target_msg.chat.id}/{target_msg.message_id}.{media_type}"
+                        
+                        supabase.storage.from_(STORAGE_BUCKET).upload(
+                            path, file_bytes,
+                            file_options={
+                                "content-type": "image/jpeg" if media_type == "photo" else ("video/mp4" if media_type == "video" else "video/mp4"),
+                                "upsert": "true"
+                            }
+                        )
+                        mid_row = fetch_one(supabase.table("messages").select("id").eq("connection_id", msg.business_connection_id).eq("chat_id", target_msg.chat.id).eq("message_id", target_msg.message_id))
+                        if mid_row:
+                            supabase.table("media_files").upsert({
+                                "message_id": mid_row["id"], "owner_id": owner_id,
+                                "media_type": media_type, "storage_path": path, "file_size": file.file_size,
+                            }, on_conflict="message_id").execute()
+                            
+                            # Обновляем media_file_id в БД (убираем EPHEMERAL)
+                            supabase.table("messages").update({"media_file_id": media_file_id}).eq("id", mid_row["id"]).execute()
 
-                    # Отправляем в чат, если это ответ на входящее сообщение (убираем строгую проверку is_ephemeral, так как Telegram часто не передает флаги в reply_to_message)
-                    if target_msg.message_id != msg.message_id and not is_outgoing:
-                        try:
-                            if media_type == "photo":
-                                prefix = "📸 Сохранено фото"
-                                if is_spoiler: prefix = "📸 Сохранено однократное фото"
-                                elif is_ttl: prefix = "📸 Сохранено исчезающее фото"
-                                input_file = types.BufferedInputFile(file_bytes, filename="photo.jpg")
-                                await bot.send_photo(owner_id, input_file, caption=prefix)
-                            elif media_type == "video":
-                                prefix = "🎬 Сохранено видео"
-                                if is_spoiler: prefix = "🎬 Сохранено однократное видео"
-                                elif is_ttl: prefix = "🎬 Сохранено исчезающее видео"
-                                input_file = types.BufferedInputFile(file_bytes, filename="video.mp4")
-                                await bot.send_video(owner_id, input_file, caption=prefix)
-                            elif media_type == "animation":
-                                input_file = types.BufferedInputFile(file_bytes, filename="animation.mp4")
-                                await bot.send_animation(owner_id, input_file, caption="🎬 Сохранена GIF-анимация")
-                        except Exception as send_err:
-                            logger.warning(f"Could not send TTL/Spoiler media back to owner: {send_err}")
-            except Exception as e:
-                logger.warning(f"media save failed: {e}")
+                        # Отправляем в чат, если это ответ на входящее сообщение
+                        if target_msg.message_id != msg.message_id and not is_outgoing:
+                            try:
+                                if media_type == "photo":
+                                    prefix = "📸 Сохранено фото"
+                                    if is_spoiler: prefix = "📸 Сохранено однократное фото"
+                                    elif is_ttl: prefix = "📸 Сохранено исчезающее фото"
+                                    input_file = types.BufferedInputFile(file_bytes, filename="photo.jpg")
+                                    await bot.send_photo(owner_id, input_file, caption=prefix)
+                                elif media_type == "video":
+                                    prefix = "🎬 Сохранено видео"
+                                    if is_spoiler: prefix = "🎬 Сохранено однократное видео"
+                                    elif is_ttl: prefix = "🎬 Сохранено исчезающее видео"
+                                    input_file = types.BufferedInputFile(file_bytes, filename="video.mp4")
+                                    await bot.send_video(owner_id, input_file, caption=prefix)
+                                elif media_type == "animation":
+                                    input_file = types.BufferedInputFile(file_bytes, filename="animation.mp4")
+                                    await bot.send_animation(owner_id, input_file, caption="🎬 Сохранена GIF-анимация")
+                            except Exception as send_err:
+                                logger.warning(f"Could not send TTL/Spoiler media back to owner: {send_err}")
+                except Exception as e:
+                    logger.warning(f"media save failed: {e}")
 
 @dp.edited_business_message()
 async def on_edited_business_message(msg: types.Message):
