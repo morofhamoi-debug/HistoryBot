@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#0b1020">
+    <title>История</title>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div id="app">
+        <header class="topbar">
+            <h1 id="app-title">🕰️ История</h1>
+            <button id="settings-btn" class="icon-btn" aria-label="Настройки">⚙️</button>
+        </header>
+
+        <main id="main-screen">
+            <section class="stats">
+                <div class="stat-card"><span id="stat-deleted">0</span><small>удалённых</small></div>
+                <div class="stat-card"><span id="stat-media">0</span><small>медиа</small></div>
+                <div class="stat-card"><span id="stat-chats">0</span><small>чатов</small></div>
+            </section>
+            <div class="search-wrap">
+                <input id="search-input" type="search" placeholder="Поиск по имени, username или ID" autocomplete="off">
+            </div>
+            <section id="contacts-list" class="contacts-list">
+                <p class="empty-state">Загрузка…</p>
+            </section>
+        </main>
+
+        <main id="chat-screen" class="hidden">
+            <button id="back-btn" class="back-btn">← Назад</button>
+            <div id="chat-header" class="chat-header"></div>
+            <div class="tabs">
+                <button class="tab active" data-tab="messages">💬 Сообщения</button>
+                <button class="tab" data-tab="media">📸 Фото / Видео</button>
+            </div>
+            <section id="chat-content"></section>
+        </main>
+
+        <div id="settings-modal" class="modal hidden">
+            <div class="modal-content">
+                <h2>Настройки</h2>
+                <p class="muted">Данные хранятся приватно. Доступ к истории имеет только владелец аккаунта.</p>
+                <button id="delete-history-btn" class="danger">Удалить всю историю</button>
+                <button id="close-settings" class="secondary">Закрыть</button>
+            </div>
+        </div>
+
+        <div id="toast" class="toast hidden"></div>
+    </div>
+    <script src="/static/app.js"></script>
+</body>
+</html>
