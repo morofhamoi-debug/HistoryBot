@@ -347,15 +347,11 @@ async def on_business_message(msg: types.Message):
         is_ttl = getattr(target_msg, 'ttl_seconds', None) is not None
         is_ephemeral = is_spoiler or is_ttl
         
-        # 1. Если это ИСХОДЯЩЕЕ сообщение и содержит медиа (фото/видео/гиф) — ИГНОРИРУЕМ
+        # Если это ИСХОДЯЩЕЕ сообщение и содержит медиа (фото/видео/гиф) — ИГНОРИРУЕМ
         if is_outgoing and media_type:
             continue
             
-        # 2. СТРОГАЯ ФИЛЬТРАЦИЯ: Если это медиа, но не исчезающее и не однократное — ИГНОРИРУЕМ
-        if media_type and not is_ephemeral:
-            continue
-            
-        # Сохраняем в БД (только текст или исчезающее/однократное медиа)
+        # Сохраняем в БД
         supabase.table("messages").upsert({
             "connection_id": msg.business_connection_id, "chat_id": target_msg.chat.id,
             "message_id": target_msg.message_id, "owner_id": owner_id,
@@ -392,7 +388,7 @@ async def on_business_message(msg: types.Message):
                             "media_type": media_type, "storage_path": path, "file_size": file.file_size,
                         }, on_conflict="message_id").execute()
 
-                    # Отправляем в чат, если это ответ на входящее сообщение
+                    # Отправляем в чат, если это ответ на входящее сообщение (убираем строгую проверку is_ephemeral, так как Telegram часто не передает флаги в reply_to_message)
                     if target_msg.message_id != msg.message_id and not is_outgoing:
                         try:
                             if media_type == "photo":
@@ -658,14 +654,13 @@ async def api_chat_messages(chat_id: int, user: dict = Depends(get_verified_user
     
     filtered_msgs = []
     for m in all_msgs:
+        # Игнорируем свои сообщения в истории
+        if m.get("sender_id") == uid:
+            continue
+            
         is_deleted = m["message_id"] in deleted_telegram_ids
         is_edited = m["id"] in edited_db_ids
         
-        # Игнорируем свои сообщения, КРОМЕ тех, что были отредактированы
-        if m.get("sender_id") == uid:
-            if not is_edited:
-                continue
-                
         if is_deleted or is_edited:
             filtered_msgs.append(m)
     
