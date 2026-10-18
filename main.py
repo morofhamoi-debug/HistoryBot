@@ -53,42 +53,48 @@ async def get_verified_user(x_telegram_init_data: str = Header(None)) -> dict:
     user = validate_init_data(x_telegram_init_data)
     if not user or not user.get("id"):
         raise HTTPException(401, "invalid initData")
-    res = supabase.table("users").select("status").eq("id", user["id"]).maybe_single().execute()
-    if not res.data or res.data.get("status") != "approved":
+    res = supabase.table("users").select("status").eq("id", user["id"]).execute()
+    if not res.data or res.data[0].get("status") != "approved":
         raise HTTPException(403, "access denied")
     return user
 
 def ensure_user(user: types.User) -> dict:
     status = "approved" if user.id == ADMIN_ID else "pending"
-    existing = supabase.table("users").select("*").eq("id", user.id).maybe_single().execute()
-    if existing.data: return existing.data
+    existing = supabase.table("users").select("*").eq("id", user.id).execute()
+    if existing.data:
+        return existing.data[0]
+    
     supabase.table("users").insert({
         "id": user.id, "first_name": user.first_name,
         "last_name": user.last_name, "username": user.username, "status": status,
     }).execute()
-    return supabase.table("users").select("*").eq("id", user.id).single().execute().data
+    return supabase.table("users").select("*").eq("id", user.id).execute().data[0]
 
 def create_access_request(user_id: int) -> dict:
     existing = supabase.table("access_requests").select("*").eq(
-        "user_id", user_id).eq("status", "pending").maybe_single().execute()
-    if existing.data: return existing.data
+        "user_id", user_id).eq("status", "pending").execute()
+    if existing.data: return existing.data[0]
+    
     res = supabase.table("access_requests").insert({"user_id": user_id, "status": "pending"}).execute()
     return res.data[0]
 
 def update_request_status(request_id: int, status: str, admin_id: int) -> Optional[dict]:
-    req = supabase.table("access_requests").select("*").eq("id", request_id).maybe_single().execute()
-    if not req.data or req.data["status"] != "pending": return None
+    req = supabase.table("access_requests").select("*").eq("id", request_id).execute()
+    if not req.data or req.data[0]["status"] != "pending": return None
+    
     supabase.table("access_requests").update({
         "status": status, "resolved_at": now_utc().isoformat(), "resolved_by": admin_id,
     }).eq("id", request_id).eq("status", "pending").execute()
+    
     supabase.table("users").update({
         "status": status, "updated_at": now_utc().isoformat(),
-    }).eq("id", req.data["user_id"]).execute()
-    return supabase.table("access_requests").select("*").eq("id", request_id).single().execute().data
+    }).eq("id", req.data[0]["user_id"]).execute()
+    
+    return supabase.table("access_requests").select("*").eq("id", request_id).execute().data[0]
 
 def get_owner_by_connection(connection_id: str) -> Optional[int]:
-    res = supabase.table("business_connections").select("owner_id").eq("id", connection_id).maybe_single().execute()
-    return res.data["owner_id"] if res.data else None
+    res = supabase.table("business_connections").select("owner_id").eq("id", connection_id).execute()
+    return res.data[0]["owner_id"] if res.data else None
 
 def upsert_chat(connection_id: str, chat: types.Chat, owner_id: int):
     supabase.table("chats").upsert({
@@ -138,7 +144,7 @@ async def cb_start_usage(cq: CallbackQuery):
     try:
         req = create_access_request(user["id"])
     except Exception as e:
-        await cq.message.answer(f"⚠️ <b>Ошибка при создании заявки:</b>\n<code>{str(e)}</code>")
+        await cq.message.answer(f"⚠️ <b>Ошибка при созда.messageнии заявки:</b>\n<code>{str(e)}</code>")
         return
 
     await cq.message.answer("📨 Заявка отправлена администратору. Ожидайте решения.")
@@ -172,7 +178,7 @@ async def cb_approve(cq: CallbackQuery):
         InlineKeyboardButton(text="📱 Открыть Историю", web_app=types.WebAppInfo(url=MINI_APP_URL))]])
     try: await bot.send_message(upd["user_id"], "✅ Ваша заявка одобрена!\nДобро пожаловать в «Историю»!", reply_markup=kb)
     except Exception: pass
-    await cq.message.edit_reply_markup(reply_markup=None)
+    await cq.edit_reply_markup(reply_markup=None)
 
 @dp.callback_query(F.data.startswith("deny:"))
 async def cb_deny(cq: CallbackQuery):
@@ -228,7 +234,7 @@ async def on_business_message(msg: types.Message):
                                   "upsert": "true"})
                 mid = supabase.table("messages").select("id").eq(
                     "connection_id", msg.business_connection_id).eq(
-                    "chat_id", msg.chat.id).eq("message_id", msg.message_id).single().execute().data["id"]
+                    "chat_id", msg.chat.id).eq("message_id", msg.message_id).execute().data[0]["id"]
                 supabase.table("media_files").upsert({
                     "message_id": mid, "owner_id": owner_id, "media_type": media_type,
                     "storage_path": path, "file_size": file.file_size,
@@ -243,15 +249,15 @@ async def on_edited_business_message(msg: types.Message):
     if not owner_id: return
     row = supabase.table("messages").select("id,text").eq(
         "connection_id", msg.business_connection_id).eq(
-        "chat_id", msg.chat.id).eq("message_id", msg.message_id).maybe_single().execute()
+        "chat_id", msg.chat.id).eq("message_id", msg.message_id).execute()
     if not row.data: return
-    old_text, new_text = row.data.get("text"), (msg.text or msg.caption)
+    old_text, new_text = row.data[0].get("text"), (msg.text or msg.caption)
     if old_text == new_text: return
     supabase.table("message_versions").insert({
-        "message_id": row.data["id"], "old_text": old_text,
+        "message_id": row.data[0]["id"], "old_text": old_text,
         "new_text": new_text, "edited_at": now_utc().isoformat(),
     }).execute()
-    supabase.table("messages").update({"text": new_text}).eq("id", row.data["id"]).execute()
+    supabase.table("messages").update({"text": new_text}).eq("id", row.data[0]["id"]).execute()
 
 @dp.deleted_business_messages()
 async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
@@ -260,7 +266,7 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
     event_hash = hashlib.sha256(
         f"{event.business_connection_id}:{event.chat.id}:{','.join(map(str, sorted(event.message_ids)))}".encode()
     ).hexdigest()
-    existing = supabase.table("deletion_events").select("id").eq("event_hash", event_hash).maybe_single().execute()
+    existing = supabase.table("deletion_events").select("id").eq("event_hash", event_hash).execute()
     if existing.data: return
     supabase.table("deletion_events").insert({
         "connection_id": event.business_connection_id, "chat_id": event.chat.id,
@@ -271,9 +277,9 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
     for mid in event.message_ids:
         row = supabase.table("messages").select("*").eq(
             "connection_id", event.business_connection_id).eq(
-            "chat_id", event.chat.id).eq("message_id", mid).maybe_single().execute()
+            "chat_id", event.chat.id).eq("message_id", mid).execute()
         if row.data:
-            m = row.data
+            m = row.data[0]
             sent = "—"
             if m.get("sent_at"):
                 try: sent = fmt_dt(datetime.fromisoformat(m["sent_at"].replace("Z", "+00:00")))
