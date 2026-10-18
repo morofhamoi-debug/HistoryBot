@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: istoriya
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        value: "5208615220"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: MINI_APP_URL
+        sync: false
+      - key: STORAGE_BUCKET
+        value: history-media
