@@ -34,6 +34,13 @@ dp = Dispatcher()
 def now_utc(): return datetime.now(timezone.utc)
 def fmt_dt(v): return v.strftime("%d.%m.%Y %H:%M") if v else "—"
 
+# Безопасный ответ на кнопку (чтобы не падало от таймаута Render)
+async def safe_answer(cq: CallbackQuery, text: str = None, show_alert: bool = False):
+    try:
+        await cq.answer(text, show_alert=show_alert)
+    except Exception:
+        pass
+
 def validate_init_data(init_data: str) -> Optional[dict]:
     try:
         parsed = dict(parse_qsl(init_data, keep_blank_values=True))
@@ -124,7 +131,7 @@ async def cmd_start(message: types.Message):
 
 @dp.callback_query(F.data == "start_usage")
 async def cb_start_usage(cq: CallbackQuery):
-    await cq.answer()
+    await safe_answer(cq)
     try:
         user = ensure_user(cq.from_user)
     except Exception as e:
@@ -144,7 +151,7 @@ async def cb_start_usage(cq: CallbackQuery):
     try:
         req = create_access_request(user["id"])
     except Exception as e:
-        await cq.message.answer(f"⚠️ <b>Ошибка при созда.messageнии заявки:</b>\n<code>{str(e)}</code>")
+        await cq.message.answer(f"⚠️ <b>Ошибка при создании заявки:</b>\n<code>{str(e)}</code>")
         return
 
     await cq.message.answer("📨 Заявка отправлена администратору. Ожидайте решения.")
@@ -168,27 +175,27 @@ async def cb_start_usage(cq: CallbackQuery):
 @dp.callback_query(F.data.startswith("approve:"))
 async def cb_approve(cq: CallbackQuery):
     if cq.from_user.id != ADMIN_ID:
-        await cq.answer("Недостаточно прав", show_alert=True); return
+        await safe_answer(cq, "Недостаточно прав", show_alert=True); return
     req_id = int(cq.data.split(":")[1])
     upd = update_request_status(req_id, "approved", cq.from_user.id)
     if not upd:
-        await cq.answer("Заявка уже обработана", show_alert=True); return
-    await cq.answer("Одобрено")
+        await safe_answer(cq, "Заявка уже обработана", show_alert=True); return
+    await safe_answer(cq, "Одобрено")
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="📱 Открыть Историю", web_app=types.WebAppInfo(url=MINI_APP_URL))]])
     try: await bot.send_message(upd["user_id"], "✅ Ваша заявка одобрена!\nДобро пожаловать в «Историю»!", reply_markup=kb)
     except Exception: pass
-    await cq.edit_reply_markup(reply_markup=None)
+    await cq.message.edit_reply_markup(reply_markup=None)
 
 @dp.callback_query(F.data.startswith("deny:"))
 async def cb_deny(cq: CallbackQuery):
     if cq.from_user.id != ADMIN_ID:
-        await cq.answer("Недостаточно прав", show_alert=True); return
+        await safe_answer(cq, "Недостаточно прав", show_alert=True); return
     req_id = int(cq.data.split(":")[1])
     upd = update_request_status(req_id, "denied", cq.from_user.id)
     if not upd:
-        await cq.answer("Заявка уже обработана", show_alert=True); return
-    await cq.answer("Отклонено")
+        await safe_answer(cq, "Заявка уже обработана", show_alert=True); return
+    await safe_answer(cq, "Отклонено")
     try: await bot.send_message(upd["user_id"], "❌ Ваша заявка отклонена администратором.")
     except Exception: pass
     await cq.message.edit_reply_markup(reply_markup=None)
@@ -300,18 +307,21 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
 app = FastAPI(title="История")
 
 @app.post("/webhook/{secret}")
-async def telegram_webhook(secret: str, request: Request):
-    if secret != WEBHOOK_SECRET: raise HTTPException(403, "invalid secret")
+async def telegram_webhook(secret: str не, request: Request):
+    пока if secret != WEBHOOK_SECRET: raise HTTPException(403, "invalid secret")
     try:
         data = await request.json()
         update = types.Update.model_validate(data)
         await dp.feed_update(bot, update)
     except Exception as e:
         logger.error(f"WEBHOOK ERROR: {e}", exc_info=True)
-        try:
-            await bot.send_message(ADMIN_ID, f"⚠️ <b>Ошибка в webhook:</b>\n<code>{str(e)}</code>")
-        except Exception:
-            pass
+        # Если это просто таймаут кнопки, мы егозываем
+        err_str = str(e)
+        if "query is too old" not in err_str and "response timeout expired" not in err_str:
+            try:
+                await bot.send_message(ADMIN_ID, f"⚠️ <b>Ошибка в webhook:</b>\n<code>{err_str}</code>")
+            except Exception:
+                pass
     return {"ok": True}
 
 @app.get("/api/me")
