@@ -374,21 +374,22 @@ async def on_business_message(msg: types.Message):
                             "media_type": media_type, "storage_path": path, "file_size": file.file_size,
                         }, on_conflict="message_id").execute()
 
-                    # Отправляем скачанный файл (байты) обратно в чат, если это был ответ
-                    if target_msg.message_id != msg.message_id:
+                    # Проверяем: медиа пришло ОТ собеседника? И это ответ на сообщение?
+                    is_incoming = (target_msg.from_user.id != owner_id) if target_msg.from_user else False
+                    is_spoiler = getattr(target_msg, 'has_media_spoiler', False)
+                    is_ttl = getattr(target_msg, 'ttl_seconds', None) is not None
+                    
+                    # Отправляем файл обратно ТОЛЬКО если это ответ на входящее TTL/Spoiler
+                    if target_msg.message_id != msg.message_id and is_incoming and (is_spoiler or is_ttl):
                         try:
-                            # Проверяем, является ли медиа однократным или исчезающим
-                            is_spoiler = getattr(target_msg, 'has_media_spoiler', False)
-                            is_ttl = getattr(target_msg, 'ttl_seconds', None) is not None
-                            
                             if media_type == "photo":
                                 prefix = "📸 Сохранено "
-                                prefix += "однократное фото" if is_spoiler else ("исчезающее фото" if is_ttl else "фото")
+                                prefix += "однократное фото" if is_spoiler else "исчезающее фото"
                                 input_file = types.BufferedInputFile(file_bytes, filename="photo.jpg")
                                 await bot.send_photo(owner_id, input_file, caption=prefix)
                             elif media_type == "video":
                                 prefix = "🎬 Сохранено "
-                                prefix += "однократное видео" if is_spoiler else ("исчезающее видео" if is_ttl else "видео")
+                                prefix += "однократное видео" if is_spoiler else "исчезающее видео"
                                 input_file = types.BufferedInputFile(file_bytes, filename="video.mp4")
                                 await bot.send_video(owner_id, input_file, caption=prefix)
                             elif media_type == "animation":
@@ -510,17 +511,42 @@ async def api_contacts(q: str = Query(""), user: dict = Depends(get_verified_use
 @app.get("/api/chat/{chat_id}/messages")
 async def api_chat_messages(chat_id: int, user: dict = Depends(get_verified_user)):
     uid = user["id"]
-    msgs = supabase.table("messages").select(
+    
+    # 1. Получаем ВСЕ сообщения
+    msgs_res = supabase.table("messages").select(
         "id,message_id,text,media_type,sent_at,sender_name,sender_username,sender_id"
     ).eq("owner_id", uid).eq("chat_id", chat_id).order("sent_at", desc=True).limit(200).execute()
+    all_msgs = msgs_res.data if msgs_res.data else []
+    
+    # 2. Получаем историю изменений
     versions = []
-    if msgs.data:
-        ids = [m["id"] for m in msgs.data]
+    if all_msgs:
+        ids = [m["id"] for m in all_msgs]
         versions = supabase.table("message_versions").select("*").in_("message_id", ids).execute().data
-    dels = supabase.table("deletion_events").select(
+        
+    # 3. Получаем события удаления
+    dels_res = supabase.table("deletion_events").select(
         "id,message_ids,detected_at"
     ).eq("owner_id", uid).eq("chat_id", chat_id).order("detected_at", desc=True).limit(100).execute()
-    return {"messages": msgs.data, "versions": versions, "deletions": dels.data}
+    dels = dels_res.data if dels_res.data else []
+    
+    # 4. ФИЛЬТРУЕМ: оставляем ТОЛЬКО удаленные или измененные сообщения
+    deleted_telegram_ids = set()
+    for d in dels:
+        deleted_telegram_ids.update(d["message_ids"])
+        
+    edited_db_ids = {v["message_id"] for v in versions}
+    
+    filtered_msgs = []
+    for m in all_msgs:
+        is_deleted = m["message_id"] in deleted_telegram_ids
+        is_edited = m["id"] in edited_db_ids
+        
+        # Показываем в Mini App только то, что было удалено или изменено
+        if is_deleted or is_edited:
+            filtered_msgs.append(m)
+    
+    return {"messages": filtered_msgs, "versions": versions, "deletions": dels}
 
 @app.get("/api/chat/{chat_id}/media")
 async def api_chat_media(chat_id: int, user: dict = Depends(get_verified_user)):
