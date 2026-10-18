@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timezone
 from io import BytesIO
 from urllib.parse import parse_qsl
-from typing import Optional, Any
+from typing import Optional
 
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException, Header, Depends, Query
@@ -53,7 +53,7 @@ def fmt_dt(v: Optional[datetime | str]) -> str:
     return v.strftime("%d.%m.%Y %H:%M")
 
 def fetch_one(query) -> Optional[dict]:
-    """Безопасное извлечение одной записи из Supabase (защита от None.data)."""
+    """Безопасное извлечение одной записи из Supabase."""
     try:
         res = query.execute()
         return res.data[0] if res.data else None
@@ -62,7 +62,7 @@ def fetch_one(query) -> Optional[dict]:
         return None
 
 async def safe_answer(cq: CallbackQuery, text: str = None, show_alert: bool = False):
-    """Безопасный ответ на callback, чтобы избежать ошибок таймаута."""
+    """Безопасный ответ на callback."""
     try:
         await cq.answer(text, show_alert=show_alert)
     except Exception:
@@ -119,27 +119,26 @@ def ensure_user(user: types.User) -> dict:
     supabase.table("users").insert(new_user).execute()
     return new_user
 
-def create_access_request(user_id: int) -> dict:
+def create_access_request(user_id: int) -> tuple[dict, bool]:
+    """Создает заявку. Возвращает (заявка, is_new)."""
     existing = fetch_one(supabase.table("access_requests").select("*").eq("user_id", user_id).eq("status", "pending"))
     if existing:
-        return existing
+        return existing, False
     
     res = supabase.table("access_requests").insert({"user_id": user_id, "status": "pending"}).execute()
-    return res.data[0]
+    return res.data[0], True
 
 def update_request_status(request_id: int, status: str, admin_id: int) -> Optional[dict]:
     req = fetch_one(supabase.table("access_requests").select("*").eq("id", request_id))
     if not req or req["status"] != "pending":
         return None
     
-    # Обновляем заявку
     supabase.table("access_requests").update({
         "status": status, 
         "resolved_at": now_utc().isoformat(), 
         "resolved_by": admin_id,
     }).eq("id", request_id).eq("status", "pending").execute()
     
-    # Обновляем пользователя
     supabase.table("users").update({
         "status": status, 
         "updated_at": now_utc().isoformat(),
@@ -176,6 +175,37 @@ def upsert_contact(owner_id: int, chat: types.Chat):
 
 # ── Aiogram: Пользователи ────────────────────────────────────────────────────
 
+async def get_instruction_msg():
+    try:
+        bot_info = await bot.get_me()
+        bot_username = bot_info.username
+    except Exception:
+        bot_username = "KhamoiHistory_Bot"
+
+    text = (
+        "✅ <b>Доступ открыт. Добро пожаловать в «Историю»!</b>\n\n"
+        "<b>Бот не подключён</b>\n"
+        "После подключения покажет удаленные и отредактированные сообщения.\n"
+        "Для сохранения сгорающих — ответьте на него любым сообщением.\n\n"
+        "• Бот присылает уведомления, когда собеседник удаляет или редактирует сообщения.\n"
+        "• Может сохранять сгорающие фото, голосовые и видео."
+    )
+    
+    # Кнопка copy_text доступна в aiogram 3.7+ (Bot API 7.0)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="Скопировать @", 
+                copy_text=types.CopyTextButton(text=f"@{bot_username}")
+            ),
+            InlineKeyboardButton(text="🔌 Подключить Историю", url="tg://settings/edit")
+        ],
+        [
+            InlineKeyboardButton(text="? Инструкция", callback_data="show_instructions")
+        ]
+    ])
+    return text, kb
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -199,22 +229,22 @@ async def cb_start_usage(cq: CallbackQuery):
         return
         
     if user["status"] == "approved":
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="📱 Открыть Историю", web_app=types.WebAppInfo(url=MINI_APP_URL))
-        ]])
-        await cq.message.answer("✅ Доступ открыт. Добро пожаловать в «Историю»!", reply_markup=kb)
+        text, kb = await get_instruction_msg()
+        await cq.message.answer(text, reply_markup=kb)
         return
-    if user["status"] == "pending":
-        await cq.message.answer("⏳ Ваша заявка уже ожидает решения администратора.")
-        return
+        
     if user["status"] in ("denied", "blocked"):
         await cq.message.answer("❌ Доступ запрещён.")
         return
         
     try:
-        req = create_access_request(user["id"])
+        req, is_new = create_access_request(user["id"])
     except Exception as e:
         await cq.message.answer(f"⚠️ <b>Ошибка при создании заявки:</b>\n<code>{str(e)}</code>")
+        return
+
+    if not is_new:
+        await cq.message.answer("⏳ Ваша заявка уже ожидает решения администратора.")
         return
 
     await cq.message.answer("📨 Заявка отправлена администратору. Ожидайте решения.")
@@ -241,6 +271,15 @@ async def cb_start_usage(cq: CallbackQuery):
     except Exception as e:
         logger.error("admin notify failed: %s", e)
 
+@dp.callback_query(F.data == "show_instructions")
+async def cb_show_instructions(cq: CallbackQuery):
+    text = (
+        "1. Нажмите кнопку \"Скопировать @\".\n"
+        "2. Нажмите кнопку \"🔌 Подключить Историю\"\n"
+        "3. Выберите \"Автоматизация чатов\" и вставьте скопированный юзернейм."
+    )
+    await safe_answer(cq, text, show_alert=True)
+
 @dp.callback_query(F.data.startswith("approve:"))
 async def cb_approve(cq: CallbackQuery):
     if cq.from_user.id != ADMIN_ID:
@@ -254,14 +293,12 @@ async def cb_approve(cq: CallbackQuery):
         return
         
     await safe_answer(cq, "Одобрено")
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📱 Открыть Историю", web_app=types.WebAppInfo(url=MINI_APP_URL))
-    ]])
     
+    text, kb = await get_instruction_msg()
     try:
-        await bot.send_message(upd["user_id"], "✅ Ваша заявка одобрена!\nДобро пожаловать в «Историю»!", reply_markup=kb)
-    except Exception:
-        pass
+        await bot.send_message(upd["user_id"], text, reply_markup=kb)
+    except Exception as e:
+        logger.error(f"failed to send instructions: {e}")
         
     await cq.message.edit_reply_markup(reply_markup=None)
 
@@ -448,7 +485,6 @@ async def telegram_webhook(secret: str, request: Request):
         logger.error(f"WEBHOOK ERROR: {e}", exc_info=True)
         err_str = str(e)
         
-        # Игнорируем ошибки таймаута старых кнопок
         if "query is too old" not in err_str and "response timeout expired" not in err_str:
             try:
                 await bot.send_message(ADMIN_ID, f"⚠️ <b>Ошибка в webhook:</b>\n<code>{err_str}</code>")
