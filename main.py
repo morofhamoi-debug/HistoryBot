@@ -332,7 +332,6 @@ async def on_business_message(msg: types.Message):
         sender = target_msg.from_user
         sender_id = sender.id if sender else None
         is_outgoing = (sender_id == owner_id)
-        is_reply = (target_msg.message_id != msg.message_id)
         
         # Определяем тип медиа
         media_type = media_file_id = None
@@ -347,89 +346,70 @@ async def on_business_message(msg: types.Message):
         is_spoiler = getattr(target_msg, 'has_media_spoiler', False)
         is_ttl = getattr(target_msg, 'ttl_seconds', None) is not None
         is_ephemeral = is_spoiler or is_ttl
-
-        # ИСХОДЯЩИЕ МЕДИА ИГНОРИРУЕМ
+        
+        # Если это ИСХОДЯЩЕЕ сообщение и содержит медиа (фото/видео/гиф) — ИГНОРИРУЕМ
         if is_outgoing and media_type:
             continue
-
-        # Ищем запись в БД (если это ответ на сообщение)
-        db_msg = None
-        if is_reply:
-            db_msg = fetch_one(supabase.table("messages").select("id, media_file_id").eq("connection_id", msg.business_connection_id).eq("chat_id", target_msg.chat.id).eq("message_id", target_msg.message_id))
-
-        was_saved_ephemeral = False
-        if db_msg and db_msg.get("media_file_id") == "EPHEMERAL":
-            was_saved_ephemeral = True
-
-        is_known_ephemeral = is_ephemeral or was_saved_ephemeral
-
-        # ФИЛЬТРАЦИЯ
-        if media_type and not is_known_ephemeral:
-            # Если это медиа и мы не знаем, что оно исчезающее — игнорируем
-            continue
-
-        # СОХРАНЯЕМ В БД (все, что прошло фильтр)
-        payload = {
+            
+        # Сохраняем в БД
+        supabase.table("messages").upsert({
             "connection_id": msg.business_connection_id, "chat_id": target_msg.chat.id,
             "message_id": target_msg.message_id, "owner_id": owner_id,
             "sender_id": sender_id,
             "sender_name": sender.full_name if sender else None,
             "sender_username": sender.username if sender else None,
             "text": target_msg.text or target_msg.caption,
-            "media_type": media_type, 
-            "media_file_id": "EPHEMERAL" if is_known_ephemeral else media_file_id,
+            "media_type": media_type, "media_file_id": media_file_id,
             "sent_at": target_msg.date.isoformat() if target_msg.date else None,
-        }
-        supabase.table("messages").upsert(payload, on_conflict="connection_id,chat_id,message_id").execute()
+        }, on_conflict="connection_id,chat_id,message_id").execute()
         
-        # Скачиваем медиа
+        # Скачиваем медиа, если есть file_id
         if media_file_id and media_type in ("photo", "video", "animation"):
-            if is_known_ephemeral:
-                try:
-                    file = await bot.get_file(media_file_id)
-                    if file.file_size and file.file_size <= 20 * 1024 * 1024:
-                        buf = BytesIO()
-                        await bot.download_file(file.file_path, buf)
-                        file_bytes = buf.getvalue()
-                        
-                        path = f"{owner_id}/{msg.business_connection_id}/{target_msg.chat.id}/{target_msg.message_id}.{media_type}"
-                        
-                        supabase.storage.from_(STORAGE_BUCKET).upload(
-                            path, file_bytes,
-                            file_options={
-                                "content-type": "image/jpeg" if media_type == "photo" else ("video/mp4" if media_type == "video" else "video/mp4"),
-                                "upsert": "true"
-                            }
-                        )
-                        mid_row = fetch_one(supabase.table("messages").select("id").eq("connection_id", msg.business_connection_id).eq("chat_id", target_msg.chat.id).eq("message_id", target_msg.message_id))
-                        if mid_row:
-                            supabase.table("media_files").upsert({
-                                "message_id": mid_row["id"], "owner_id": owner_id,
-                                "media_type": media_type, "storage_path": path, "file_size": file.file_size,
-                            }, on_conflict="message_id").execute()
+            try:
+                file = await bot.get_file(media_file_id)
+                if file.file_size and file.file_size <= 20 * 1024 * 1024:
+                    buf = BytesIO()
+                    await bot.download_file(file.file_path, buf)
+                    file_bytes = buf.getvalue()
+                    
+                    path = f"{owner_id}/{msg.business_connection_id}/{target_msg.chat.id}/{target_msg.message_id}.{media_type}"
+                    
+                    supabase.storage.from_(STORAGE_BUCKET).upload(
+                        path, file_bytes,
+                        file_options={
+                            "content-type": "image/jpeg" if media_type == "photo" else ("video/mp4" if media_type == "video" else "video/mp4"),
+                            "upsert": "true"
+                        }
+                    )
+                    mid_row = fetch_one(supabase.table("messages").select("id").eq("connection_id", msg.business_connection_id).eq("chat_id", target_msg.chat.id).eq("message_id", target_msg.message_id))
+                    if mid_row:
+                        supabase.table("media_files").upsert({
+                            "message_id": mid_row["id"], "owner_id": owner_id,
+                            "media_type": media_type, "storage_path": path, "file_size": file.file_size,
+                        }, on_conflict="message_id").execute()
 
-                        # Отправляем в чат, если это ответ на входящее
-                        if is_reply and not is_outgoing:
-                            try:
-                                if media_type == "photo":
-                                    prefix = "📸 Сохранено фото"
-                                    if is_spoiler: prefix = "📸 Сохранено однократное фото"
-                                    elif is_ttl: prefix = "📸 Сохранено исчезающее фото"
-                                    input_file = types.BufferedInputFile(file_bytes, filename="photo.jpg")
-                                    await bot.send_photo(owner_id, input_file, caption=prefix)
-                                elif media_type == "video":
-                                    prefix = "🎬 Сохранено видео"
-                                    if is_spoiler: prefix = "🎬 Сохранено однократное видео"
-                                    elif is_ttl: prefix = "🎬 Сохранено исчезающее видео"
-                                    input_file = types.BufferedInputFile(file_bytes, filename="video.mp4")
-                                    await bot.send_video(owner_id, input_file, caption=prefix)
-                                elif media_type == "animation":
-                                    input_file = types.BufferedInputFile(file_bytes, filename="animation.mp4")
-                                    await bot.send_animation(owner_id, input_file, caption="🎬 Сохранена GIF-анимация")
-                            except Exception as send_err:
-                                logger.warning(f"Could not send TTL/Spoiler media back to owner: {send_err}")
-                except Exception as e:
-                    logger.warning(f"media save failed: {e}")
+                    # Отправляем в чат, если это ответ на входящее сообщение (убираем строгую проверку is_ephemeral, так как Telegram часто не передает флаги в reply_to_message)
+                    if target_msg.message_id != msg.message_id and not is_outgoing:
+                        try:
+                            if media_type == "photo":
+                                prefix = "📸 Сохранено фото"
+                                if is_spoiler: prefix = "📸 Сохранено однократное фото"
+                                elif is_ttl: prefix = "📸 Сохранено исчезающее фото"
+                                input_file = types.BufferedInputFile(file_bytes, filename="photo.jpg")
+                                await bot.send_photo(owner_id, input_file, caption=prefix)
+                            elif media_type == "video":
+                                prefix = "🎬 Сохранено видео"
+                                if is_spoiler: prefix = "🎬 Сохранено однократное видео"
+                                elif is_ttl: prefix = "🎬 Сохранено исчезающее видео"
+                                input_file = types.BufferedInputFile(file_bytes, filename="video.mp4")
+                                await bot.send_video(owner_id, input_file, caption=prefix)
+                            elif media_type == "animation":
+                                input_file = types.BufferedInputFile(file_bytes, filename="animation.mp4")
+                                await bot.send_animation(owner_id, input_file, caption="🎬 Сохранена GIF-анимация")
+                        except Exception as send_err:
+                            logger.warning(f"Could not send TTL/Spoiler media back to owner: {send_err}")
+            except Exception as e:
+                logger.warning(f"media save failed: {e}")
 
 @dp.edited_business_message()
 async def on_edited_business_message(msg: types.Message):
@@ -439,6 +419,7 @@ async def on_edited_business_message(msg: types.Message):
     if not owner_id:
         return
         
+    # Извлекаем данные отправителя для уведомления
     row = fetch_one(supabase.table("messages").select("id,text,sender_id,sender_name,sender_username").eq("connection_id", msg.business_connection_id).eq("chat_id", msg.chat.id).eq("message_id", msg.message_id))
     if not row:
         return
@@ -447,13 +428,16 @@ async def on_edited_business_message(msg: types.Message):
     if old_text == new_text:
         return
         
+    # Сохраняем в историю версий
     supabase.table("message_versions").insert({
         "message_id": row["id"], "old_text": old_text,
         "new_text": new_text, "edited_at": now_utc().isoformat(),
     }).execute()
     
+    # Обновляем основной текст
     supabase.table("messages").update({"text": new_text}).eq("id", row["id"]).execute()
     
+    # Отправляем уведомление, только если это сообщение собеседника
     sender_id = row.get("sender_id")
     if sender_id != owner_id:
         sender_name = row.get("sender_name") or "Неизвестно"
@@ -490,6 +474,7 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
         
         if row:
             m = row
+            # ПОЛНОСТЬЮ ИГНОРИРУЕМ УДАЛЕНИЕ СВОИХ СООБЩЕНИЙ
             if m.get("sender_id") == owner_id:
                 continue
                 
@@ -518,6 +503,7 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
                         "path": mf_row["storage_path"]
                     })
                     
+    # Если валидных сообщений нет (удалены только свои), ничего не сохраняем и не шлем
     if not valid_message_ids:
         return
         
@@ -597,17 +583,20 @@ async def api_stats(user: dict = Depends(get_verified_user)):
 async def api_contacts(q: str = Query(""), user: dict = Depends(get_verified_user)):
     uid = user["id"]
     
+    # Получаем все сообщения пользователя для маппинга ID сообщений в ID чатов
     user_msgs = supabase.table("messages").select("id, chat_id").eq("owner_id", uid).execute()
     user_msg_ids = [m["id"] for m in user_msgs.data] if user_msgs.data else []
     msg_to_chat = {m["id"]: m["chat_id"] for m in user_msgs.data} if user_msgs.data else {}
     
     active_chat_ids = set()
     
+    # 1. Чаты с удаленными сообщениями
     dels = supabase.table("deletion_events").select("chat_id").eq("owner_id", uid).execute()
     if dels.data:
         for d in dels.data:
             active_chat_ids.add(d["chat_id"])
             
+    # 2. Чаты с сохраненными медиафайлами
     media = supabase.table("media_files").select("message_id").eq("owner_id", uid).execute()
     if media.data:
         for m in media.data:
@@ -615,6 +604,7 @@ async def api_contacts(q: str = Query(""), user: dict = Depends(get_verified_use
             if chat_id:
                 active_chat_ids.add(chat_id)
                 
+    # 3. Чаты с измененными сообщениями
     if user_msg_ids:
         vers_res = supabase.table("message_versions").select("message_id").in_("message_id", user_msg_ids).execute()
         if vers_res.data:
@@ -664,6 +654,7 @@ async def api_chat_messages(chat_id: int, user: dict = Depends(get_verified_user
     
     filtered_msgs = []
     for m in all_msgs:
+        # Игнорируем свои сообщения в истории
         if m.get("sender_id") == uid:
             continue
             
