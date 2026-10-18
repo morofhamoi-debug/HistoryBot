@@ -5,6 +5,7 @@ import json
 import hmac
 import hashlib
 import logging
+import asyncio
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from urllib.parse import parse_qsl
@@ -18,6 +19,8 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from supabase import create_client, Client
 
 # ── Конфигурация ─────────────────────────────────────────────────────────────
@@ -39,6 +42,10 @@ dp = Dispatcher()
 
 # Московское время (UTC+3)
 MSK_TZ = timezone(timedelta(hours=3))
+
+# ── Состояния (для ввода даты) ───────────────────────────────────────────────
+class AdminState(StatesGroup):
+    waiting_for_custom_date = State()
 
 # ── Утилиты ──────────────────────────────────────────────────────────────────
 
@@ -95,9 +102,21 @@ async def get_verified_user(x_telegram_init_data: str = Header(None)) -> dict:
     user = validate_init_data(x_telegram_init_data)
     if not user or not user.get("id"):
         raise HTTPException(status_code=401, detail="invalid initData")
-    db_user = fetch_one(supabase.table("users").select("status").eq("id", user["id"]))
+    db_user = fetch_one(supabase.table("users").select("status, valid_until").eq("id", user["id"]))
     if not db_user or db_user.get("status") != "approved":
         raise HTTPException(status_code=403, detail="access denied")
+        
+    # Проверка срока действия
+    v_until = db_user.get("valid_until")
+    if v_until:
+        try:
+            dt = datetime.fromisoformat(v_until.replace("Z", "+00:00"))
+            if dt < now_utc():
+                supabase.table("users").update({"status": "denied"}).eq("id", user["id"]).execute()
+                raise HTTPException(status_code=403, detail="term expired")
+        except ValueError:
+            pass
+            
     return user
 
 # ── База данных ──────────────────────────────────────────────────────────────
@@ -122,16 +141,23 @@ def create_access_request(user_id: int) -> tuple[dict, bool]:
     res = supabase.table("access_requests").insert({"user_id": user_id, "status": "pending"}).execute()
     return res.data[0], True
 
-def update_request_status(request_id: int, status: str, admin_id: int) -> Optional[dict]:
+def update_request_status(request_id: int, status: str, admin_id: int, valid_until: Optional[str] = None) -> Optional[dict]:
     req = fetch_one(supabase.table("access_requests").select("*").eq("id", request_id))
     if not req or req["status"] != "pending":
         return None
+        
+    if valid_until and status == "pending":
+        status = "approved"
+
     supabase.table("access_requests").update({
         "status": status, "resolved_at": now_utc().isoformat(), "resolved_by": admin_id,
     }).eq("id", request_id).eq("status", "pending").execute()
-    supabase.table("users").update({
-        "status": status, "updated_at": now_utc().isoformat(),
-    }).eq("id", req["user_id"]).execute()
+    
+    update_data = {"status": status, "updated_at": now_utc().isoformat()}
+    if valid_until:
+        update_data["valid_until"] = valid_until
+        
+    supabase.table("users").update(update_data).eq("id", req["user_id"]).execute()
     return fetch_one(supabase.table("access_requests").select("*").eq("id", request_id))
 
 def get_owner_by_connection(connection_id: str) -> Optional[int]:
@@ -180,6 +206,192 @@ async def get_instruction_msg():
     ])
     return text, kb
 
+# ── Aiogram: Админ-панель ────────────────────────────────────────────────────
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")]
+    ])
+    await message.answer("🛠 <b>Админ-панель</b>\nВыберите действие:", reply_markup=kb)
+
+@dp.callback_query(F.data == "admin_users")
+async def cb_admin_users(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    
+    res = supabase.table("users").select("*").neq("id", ADMIN_ID).order("created_at", desc=True).limit(30).execute()
+    users = res.data if res.data else []
+    
+    if not users:
+        await cq.message.edit_text("В базе пока нет других пользователей.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]]))
+        return
+        
+    kb_buttons = []
+    for u in users:
+        name = f"{u.get('first_name') or ''} {u.get('last_name') or ''}".strip()
+        if not name: name = str(u['id'])
+        status_emoji = "🟢" if u['status'] == 'approved' else ("⏳" if u['status'] == 'pending' else "🔴")
+        kb_buttons.append([InlineKeyboardButton(text=f"{status_emoji} {name} (ID: {u['id']})", callback_data=f"admin_user:{u['id']}")])
+        
+    kb_buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+    
+    text = "👥 <b>Список пользователей</b>\nВыберите пользователя:"
+    try:
+        await cq.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await cq.message.answer(text, reply_markup=kb)
+
+@dp.callback_query(F.data == "admin_back")
+async def cb_admin_back(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")]
+    ])
+    await cq.message.edit_text("🛠 <b>Админ-панель</b>\nВыберите действие:", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("admin_user:"))
+async def cb_admin_user_card(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    
+    uid = int(cq.data.split(":")[1])
+    u = fetch_one(supabase.table("users").select("*").eq("id", uid))
+    if not u:
+        await cq.message.edit_text("Пользователь не найден.")
+        return
+        
+    name = f"{u.get('first_name') or ''} {u.get('last_name') or ''}".strip()
+    uname = f"@{u['username']}" if u.get('username') else "—"
+    status = u['status']
+    valid = fmt_dt(u.get('valid_until')) if u.get('valid_until') else "Бессрочно"
+    
+    text = (
+        f"👤 <b>Пользователь:</b> {name}\n"
+        f"🆔 ID: <code>{uid}</code>\n"
+        f"🔗 Username: {uname}\n"
+        f"📌 Статус: {status}\n"
+        f"📅 Срок до: {valid}"
+    )
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔴 Запретить", callback_data=f"admin_deny:{uid}")],
+        [InlineKeyboardButton(text="📅 Срок", callback_data=f"term_menu:{uid}:user")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_users")]
+    ])
+    
+    await cq.message.edit_text(text, reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("admin_deny:"))
+async def cb_admin_deny(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID: return
+    uid = int(cq.data.split(":")[1])
+    supabase.table("users").update({"status": "blocked"}).eq("id", uid).execute()
+    await safe_answer(cq, "Пользователь заблокирован", show_alert=True)
+    await cb_admin_user_card(cq)
+
+# ── Установка срока ─────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data.startswith("term_menu:"))
+async def cb_term_menu(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    
+    parts = cq.data.split(":")
+    target_id = parts[1] 
+    is_req = len(parts) > 2 and parts[2] == "req"
+    
+    text = "📅 <b>Выберите срок действия</b>\nНа сколько выдать доступ?"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 день", callback_data=f"term_set:{target_id}:1:{'req' if is_req else 'user'}"),
+         InlineKeyboardButton(text="7 дней", callback_data=f"term_set:{target_id}:7:{'req' if is_req else 'user'}")],
+        [InlineKeyboardButton(text="30 дней", callback_data=f"term_set:{target_id}:30:{'req' if is_req else 'user'}"),
+         InlineKeyboardButton(text="Навсегда", callback_data=f"term_set:{target_id}:0:{'req' if is_req else 'user'}")],
+        [InlineKeyboardButton(text="✍️ Ввести вручную", callback_data=f"term_manual:{target_id}:{'req' if is_req else 'user'}")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_user:{target_id}" if not is_req else f"cancel")]
+    ])
+    
+    await cq.message.edit_text(text, reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("term_set:"))
+async def cb_term_set(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    
+    parts = cq.data.split(":")
+    target_id = int(parts[1])
+    days = int(parts[2])
+    target_type = parts[3]
+    
+    valid_until = None
+    if days > 0:
+        valid_until = (now_utc() + timedelta(days=days)).isoformat()
+        
+    if target_type == "user":
+        supabase.table("users").update({"status": "approved", "valid_until": valid_until}).eq("id", target_id).execute()
+    else:
+        req = fetch_one(supabase.table("access_requests").select("user_id").eq("id", target_id))
+        if req:
+            supabase.table("users").update({"status": "approved", "valid_until": valid_until}).eq("id", req["user_id"]).execute()
+            supabase.table("access_requests").update({"status": "approved", "resolved_at": now_utc().isoformat()}).eq("id", target_id).execute()
+            text, kb = await get_instruction_msg()
+            try: await bot.send_message(req["user_id"], text, reply_markup=kb)
+            except Exception: pass
+
+    await cq.message.edit_text("✅ Срок успешно установлен.")
+    await asyncio.sleep(1.5)
+    if target_type == "user":
+        await cb_admin_user_card(cq)
+    else:
+        await cq.message.delete()
+
+@dp.callback_query(F.data.startswith("term_manual:"))
+async def cb_term_manual(cq: CallbackQuery, state: FSMContext):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    
+    parts = cq.data.split(":")
+    await state.update_data(target_id=parts[1], target_type=parts[2])
+    await state.set_state(AdminState.waiting_for_custom_date)
+    
+    await cq.message.edit_text("✍️ Отправьте дату и время в формате:\n<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\nПример: <code>31.12.2026 23:59</code>")
+
+@dp.message(AdminState.waiting_for_custom_date)
+async def process_custom_date(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    
+    try:
+        dt = datetime.strptime(message.text, "%d.%m.%Y %H:%M").replace(tzinfo=MSK_TZ)
+        valid_until = dt.astimezone(timezone.utc).isoformat()
+    except ValueError:
+        await message.answer("❌ Неверный формат. Попробуйте снова: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>")
+        return
+        
+    data = await state.get_data()
+    target_id = int(data["target_id"])
+    target_type = data["target_type"]
+    await state.clear()
+    
+    if target_type == "user":
+        supabase.table("users").update({"status": "approved", "valid_until": valid_until}).eq("id", target_id).execute()
+        await message.answer(f"✅ Срок установлен до: {fmt_dt(valid_until)}")
+    else:
+        req = fetch_one(supabase.table("access_requests").select("user_id").eq("id", target_id))
+        if req:
+            supabase.table("users").update({"status": "approved", "valid_until": valid_until}).eq("id", req["user_id"]).execute()
+            supabase.table("access_requests").update({"status": "approved", "resolved_at": now_utc().isoformat()}).eq("id", target_id).execute()
+            text, kb = await get_instruction_msg()
+            try: await bot.send_message(req["user_id"], text, reply_markup=kb)
+            except Exception: pass
+        await message.answer(f"✅ Пользователь одобрен, срок до: {fmt_dt(valid_until)}")
+
+# ── Стандартные команды ──────────────────────────────────────────────────────
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -201,6 +413,17 @@ async def cb_start_usage(cq: CallbackQuery):
         return
         
     if user["status"] == "approved":
+        # Проверка срока
+        if user.get("valid_until"):
+            try:
+                v_until = datetime.fromisoformat(user["valid_until"].replace("Z", "+00:00"))
+                if v_until < now_utc():
+                    supabase.table("users").update({"status": "denied"}).eq("id", user["id"]).execute()
+                    await cq.message.answer("❌ Срок действия вашего доступа истек.")
+                    return
+            except ValueError:
+                pass
+                
         text, kb = await get_instruction_msg()
         await cq.message.answer(text, reply_markup=kb)
         return
@@ -231,11 +454,15 @@ async def cb_start_usage(cq: CallbackQuery):
         f"🕒 Время: {now_utc().astimezone(MSK_TZ).strftime('%H:%M')}\n"
         "📌 Статус: Ожидает рассмотрения"
     )
+    
+    # ТВОЙ ЭСКИЗ (Разрешить/Запретить сверху, Срок снизу)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Перейти в диалог", url=f"tg://user?id={cq.from_user.id}")],
         [InlineKeyboardButton(text="🟢 Разрешить", callback_data=f"approve:{req['id']}"),
          InlineKeyboardButton(text="🔴 Запретить", callback_data=f"deny:{req['id']}")],
+        [InlineKeyboardButton(text="📅 Срок", callback_data=f"term_menu:{req['id']}:req")]
     ])
+    
     try:
         await bot.send_message(ADMIN_ID, text, reply_markup=kb)
     except Exception as e:
@@ -266,7 +493,7 @@ async def cb_approve(cq: CallbackQuery):
         await bot.send_message(upd["user_id"], text, reply_markup=kb)
     except Exception as e:
         logger.error(f"failed to send instructions: {e}")
-    await cq.message.edit_reply_markup(reply_markup=None)
+    await cq.message.delete()
 
 @dp.callback_query(F.data.startswith("deny:"))
 async def cb_deny(cq: CallbackQuery):
@@ -283,7 +510,7 @@ async def cb_deny(cq: CallbackQuery):
         await bot.send_message(upd["user_id"], "❌ Ваша заявка отклонена администратором.")
     except Exception:
         pass
-    await cq.message.edit_reply_markup(reply_markup=None)
+    await cq.message.delete()
 
 # ── Aiogram: Business-события ────────────────────────────────────────────────
 
@@ -388,7 +615,7 @@ async def on_business_message(msg: types.Message):
                             "media_type": media_type, "storage_path": path, "file_size": file.file_size,
                         }, on_conflict="message_id").execute()
 
-                    # Отправляем в чат, если это ответ на входящее сообщение (убираем строгую проверку is_ephemeral, так как Telegram часто не передает флаги в reply_to_message)
+                    # Отправляем в чат, если это ответ на входящее сообщение
                     if target_msg.message_id != msg.message_id and not is_outgoing:
                         try:
                             if media_type == "photo":
