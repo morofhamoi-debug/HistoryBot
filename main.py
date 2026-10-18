@@ -374,22 +374,21 @@ async def on_business_message(msg: types.Message):
                             "media_type": media_type, "storage_path": path, "file_size": file.file_size,
                         }, on_conflict="message_id").execute()
 
-                    # Проверяем: медиа пришло ОТ собеседника? И это ответ на сообщение?
-                    is_incoming = (target_msg.from_user.id != owner_id) if target_msg.from_user else False
-                    is_spoiler = getattr(target_msg, 'has_media_spoiler', False)
-                    is_ttl = getattr(target_msg, 'ttl_seconds', None) is not None
-                    
-                    # Отправляем файл обратно ТОЛЬКО если это ответ на входящее TTL/Spoiler
-                    if target_msg.message_id != msg.message_id and is_incoming and (is_spoiler or is_ttl):
+                    # Если это ответ на сообщение, и отправитель НЕ владелец, отправляем фото/видео в чат
+                    sender_id = target_msg.from_user.id if target_msg.from_user else None
+                    if target_msg.message_id != msg.message_id and sender_id != owner_id:
                         try:
+                            is_spoiler = getattr(target_msg, 'has_media_spoiler', False)
+                            is_ttl = getattr(target_msg, 'ttl_seconds', None) is not None
+                            
                             if media_type == "photo":
                                 prefix = "📸 Сохранено "
-                                prefix += "однократное фото" if is_spoiler else "исчезающее фото"
+                                prefix += "однократное фото" if is_spoiler else ("исчезающее фото" if is_ttl else "фото")
                                 input_file = types.BufferedInputFile(file_bytes, filename="photo.jpg")
                                 await bot.send_photo(owner_id, input_file, caption=prefix)
                             elif media_type == "video":
                                 prefix = "🎬 Сохранено "
-                                prefix += "однократное видео" if is_spoiler else "исчезающее видео"
+                                prefix += "однократное видео" if is_spoiler else ("исчезающее видео" if is_ttl else "видео")
                                 input_file = types.BufferedInputFile(file_bytes, filename="video.mp4")
                                 await bot.send_video(owner_id, input_file, caption=prefix)
                             elif media_type == "animation":
