@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from io import BytesIO
 from urllib.parse import parse_qsl
 from typing import Optional
+from zoneinfo import ZoneInfo  # Для правильного часового пояса
 
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException, Header, Depends, Query
@@ -37,6 +38,9 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
+# Часовой пояс (Москва, UTC+3)
+MSK_TZ = ZoneInfo("Europe/Moscow")
+
 # ── Утилиты ──────────────────────────────────────────────────────────────────
 
 def now_utc() -> datetime:
@@ -50,6 +54,11 @@ def fmt_dt(v: Optional[datetime | str]) -> str:
             v = datetime.fromisoformat(v.replace("Z", "+00:00"))
         except ValueError:
             return v
+    if v.tzinfo is None:
+        v = v.replace(tzinfo=timezone.utc)
+    
+    # Переводим в московское время
+    v = v.astimezone(MSK_TZ)
     return v.strftime("%d.%m.%Y %H:%M")
 
 def fetch_one(query) -> Optional[dict]:
@@ -62,7 +71,7 @@ def fetch_one(query) -> Optional[dict]:
         return None
 
 async def safe_answer(cq: CallbackQuery, text: str = None, show_alert: bool = False):
-    """Безопасный ответ на callback."""
+    """Безопасный ответ на callback, чтобы не было ошибок таймаута."""
     try:
         await cq.answer(text, show_alert=show_alert)
     except Exception:
@@ -255,13 +264,13 @@ async def cb_start_usage(cq: CallbackQuery):
         f"👥 Фамилия: {cq.from_user.last_name or 'отсутствует'}\n"
         f"🔗 Username: {uname}\n"
         f"🆔 Telegram ID: <code>{cq.from_user.id}</code>\n"
-        f"📅 Дата: {now_utc().strftime('%d.%m.%Y')}\n"
-        f"🕒 Время: {now_utc().strftime('%H:%M')}\n"
+        f"📅 Дата: {now_utc().astimezone(MSK_TZ).strftime('%d.%m.%Y')}\n"
+        f"🕒 Время: {now_utc().astimezone(MSK_TZ).strftime('%H:%M')}\n"
         "📌 Статус: Ожидает рассмотрения"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Перейти в диалог", url=f"tg://user?id={cq.from_user.id}")],
-        [InlineKeyboardButton(text="🟢 Разрешить", callback_data=f"approve:{req['id']}"),
+ if        [InlineKeyboardButton(text="🟢 Раз notрешить upd", callback_data=f"approve:{req['id']}"),
          InlineKeyboardButton(text="🔴 Запретить", callback_data=f"deny:{req['id']}")],
     ])
     
@@ -287,7 +296,7 @@ async def cb_approve(cq: CallbackQuery):
         
     req_id = int(cq.data.split(":")[1])
     upd = update_request_status(req_id, "approved", cq.from_user.id)
-    if not upd:
+   :
         await safe_answer(cq, "Заявка уже обработана", show_alert=True)
         return
         
@@ -324,7 +333,6 @@ async def cb_deny(cq: CallbackQuery):
 
 @dp.business_connection()
 async def on_business_connection(conn: types.BusinessConnection):
-    # Сохраняем или обновляем подключение в базе
     supabase.table("business_connections").upsert({
         "id": conn.id,
         "owner_id": conn.user.id,
@@ -332,7 +340,6 @@ async def on_business_connection(conn: types.BusinessConnection):
         "updated_at": now_utc().isoformat(),
     }, on_conflict="id").execute()
 
-    # Отправляем уведомление пользователю
     if conn.is_enabled:
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📱 Открыть Историю", web_app=types.WebAppInfo(url=MINI_APP_URL))]
@@ -364,55 +371,73 @@ async def on_business_message(msg: types.Message):
         
     upsert_chat(msg.business_connection_id, msg.chat, owner_id)
     upsert_contact(owner_id, msg.chat)
-    
-    sender = msg.from_user
-    media_type = media_file_id = None
-    if msg.photo:
-        media_type, media_file_id = "photo", msg.photo[-1].file_id
-    elif msg.video:
-        media_type, media_file_id = "video", msg.video.file_id
+
+    # Обрабатываем как само сообщение, так и сообщение, на которое ответили
+    messages_to_process = [msg]
+    if msg.reply_to_message:
+        messages_to_process.append(msg.reply_to_message)
+
+    for target_msg in messages_to_process:
+        sender = target_msg.from_user
+        media_type = media_file_id = None
         
-    supabase.table("messages").upsert({
-        "connection_id": msg.business_connection_id,
-        "chat_id": msg.chat.id,
-        "message_id": msg.message_id,
-        "owner_id": owner_id,
-        "sender_id": sender.id if sender else None,
-        "sender_name": sender.full_name if sender else None,
-        "sender_username": sender.username if sender else None,
-        "text": msg.text or msg.caption,
-        "media_type": media_type,
-        "media_file_id": media_file_id,
-        "sent_at": msg.date.isoformat() if msg.date else None,
-    }, on_conflict="connection_id,chat_id,message_id").execute()
-    
-    if media_file_id and media_type in ("photo", "video"):
-        try:
-            file = await bot.get_file(media_file_id)
-            if file.file_size and file.file_size <= 20 * 1024 * 1024:
-                buf = BytesIO()
-                await bot.download_file(file.file_path, buf)
-                path = f"{owner_id}/{msg.business_connection_id}/{msg.chat.id}/{msg.message_id}.{media_type}"
-                
-                supabase.storage.from_(STORAGE_BUCKET).upload(
-                    path, buf.getvalue(),
-                    file_options={
-                        "content-type": "image/jpeg" if media_type == "photo" else "video/mp4",
-                        "upsert": "true"
-                    }
-                )
-                
-                mid_row = fetch_one(supabase.table("messages").select("id").eq("connection_id", msg.business_connection_id).eq("chat_id", msg.chat.id).eq("message_id", msg.message_id))
-                if mid_row:
-                    supabase.table("media_files").upsert({
-                        "message_id": mid_row["id"],
-                        "owner_id": owner_id,
-                        "media_type": media_type,
-                        "storage_path": path,
-                        "file_size": file.file_size,
-                    }, on_conflict="message_id").execute()
-        except Exception as e:
-            logger.warning("media save failed: %s", e)
+        if target_msg.photo:
+            media_type, media_file_id = "photo", target_msg.photo[-1].file_id
+        elif target_msg.video:
+            media_type, media_file_id = "video", target_msg.video.file_id
+            
+        supabase.table("messages").upsert({
+            "connection_id": msg.business_connection_id,
+            "chat_id": target_msg.chat.id,
+            "message_id": target_msg.message_id,
+            "owner_id": owner_id,
+            "sender_id": sender.id if sender else None,
+            "sender_name": sender.full_name if sender else None,
+            "sender_username": sender.username if sender else None,
+            "text": target_msg.text or target_msg.caption,
+            "media_type": media_type,
+            "media_file_id": media_file_id,
+            "sent_at": target_msg.date.isoformat() if target_msg.date else None,
+        }, on_conflict="connection_id,chat_id,message_id").execute()
+        
+        if media_file_id and media_type in ("photo", "video"):
+            try:
+                file = await bot.get_file(media_file_id)
+                if file.file_size and file.file_size <= 20 * 1024 * 1024:
+                    buf = BytesIO()
+                    await bot.download_file(file.file_path, buf)
+                    path = f"{owner_id}/{msg.business_connection_id}/{target_msg.chat.id}/{target_msg.message_id}.{media_type}"
+                    
+                    supabase.storage.from_(STORAGE_BUCKET).upload(
+                        path, buf.getvalue(),
+                        file_options={
+                            "content-type": "image/jpeg" if media_type == "photo" else "video/mp4",
+                            "upsert": "true"
+                        }
+                    )
+                    
+                    mid_row = fetch_one(supabase.table("messages").select("id").eq("connection_id", msg.business_connection_id).eq("chat_id", target_msg.chat.id).eq("message_id", target_msg.message_id))
+                    if mid_row:
+                        supabase.table("media_files").upsert({
+                            "message_id": mid_row["id"],
+                            "owner_id": owner_id,
+                            "media_type": media_type,
+                            "storage_path": path,
+                            "file_size": file.file_size,
+                        }, on_conflict="message_id").execute()
+
+                    # Если это исчезающее медиа, отправляем его в чат
+                    if target_msg.message_id != msg.message_id:
+                        try:
+                            if media_type == "photo":
+                                await bot.send_photo(owner_id, media_file_id, caption="📸 Сохранено исчезающее фото")
+                            elif media_type == "video":
+                                await bot.send_video(owner_id, media_file_id, caption="🎬 Сохранено исчезающее видео")
+                        except Exception as e:
+                            logger.warning(f"Could not send TTL media back to owner: {e}")
+
+            except Exception as e:
+                logger.warning(f"media save failed: {e}")
 
 @dp.edited_business_message()
 async def on_edited_business_message(msg: types.Message):
@@ -470,15 +495,17 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
         if row:
             m = row
             sent = fmt_dt(m.get("sent_at"))
+            # Используем blockquote для красивого оформления цитаты
             parts.append(
                 f"👤 Отправитель: {m.get('sender_name') or 'Неизвестно'}\n"
                 f"🔗 Username: {m.get('sender_username') or 'Не указан'}\n"
                 f"🆔 Telegram ID: {m.get('sender_id') or '—'}\n"
-                f"💬 Сообщение:\n«{m.get('text') or 'Содержимое недоступно'}»\n"
+                f"💬 Сообщение:\n"
+                f"<blockquote>«{m.get('text') or 'Содержимое недоступно'}»</blockquote>\n"
                 f"🕒 Отправлено: {sent}"
             )
         else:
-            parts.append(f"💬 Сообщение: «Содержимое недоступно»\n🆔 ID сообщения: {mid}")
+            parts.append(f"💬 Сообщение:\n<blockquote>«Содержимое недоступно»</blockquote>\n🆔 ID сообщения: {mid}")
             
     text = (
         "🗑 <b>УДАЛЕНО СООБЩЕНИЕ</b>\n\n" + "\n\n".join(parts) +
