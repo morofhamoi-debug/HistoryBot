@@ -164,6 +164,23 @@ def get_owner_by_connection(connection_id: str) -> Optional[int]:
     res = fetch_one(supabase.table("business_connections").select("owner_id").eq("id", connection_id))
     return res["owner_id"] if res else None
 
+# ДОБАВЛЕНА ФУНКЦИЯ ПРОВЕРКИ ДОСТУПА
+def is_user_active(user_id: int) -> bool:
+    u = fetch_one(supabase.table("users").select("status, valid_until").eq("id", user_id))
+    if not u or u.get("status") != "approved":
+        return False
+    
+    v_until = u.get("valid_until")
+    if v_until:
+        try:
+            dt = datetime.fromisoformat(v_until.replace("Z", "+00:00"))
+            if dt < now_utc():
+                supabase.table("users").update({"status": "denied"}).eq("id", user_id).execute()
+                return False
+        except ValueError:
+            pass
+    return True
+
 def upsert_chat(connection_id: str, chat: types.Chat, owner_id: int):
     supabase.table("chats").upsert({
         "connection_id": connection_id, "chat_id": chat.id, "chat_type": str(chat.type),
@@ -548,6 +565,11 @@ async def on_business_message(msg: types.Message):
     owner_id = get_owner_by_connection(msg.business_connection_id)
     if not owner_id:
         return
+        
+    # ДОБАВЛЕНА ПРОВЕРКА
+    if not is_user_active(owner_id):
+        return
+        
     upsert_chat(msg.business_connection_id, msg.chat, owner_id)
     upsert_contact(owner_id, msg.chat)
 
@@ -646,6 +668,10 @@ async def on_edited_business_message(msg: types.Message):
     if not owner_id:
         return
         
+    # ДОБАВЛЕНА ПРОВЕРКА
+    if not is_user_active(owner_id):
+        return
+        
     # Извлекаем данные отправителя для уведомления
     row = fetch_one(supabase.table("messages").select("id,text,sender_id,sender_name,sender_username").eq("connection_id", msg.business_connection_id).eq("chat_id", msg.chat.id).eq("message_id", msg.message_id))
     if not row:
@@ -690,6 +716,10 @@ async def on_edited_business_message(msg: types.Message):
 async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
     owner_id = get_owner_by_connection(event.business_connection_id)
     if not owner_id:
+        return
+        
+    # ДОБАВЛЕНА ПРОВЕРКА
+    if not is_user_active(owner_id):
         return
         
     parts = []
