@@ -5,11 +5,10 @@ import json
 import hmac
 import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from urllib.parse import parse_qsl
 from typing import Optional
-from zoneinfo import ZoneInfo  # Для правильного часового пояса
 
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException, Header, Depends, Query
@@ -38,8 +37,8 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
-# Часовой пояс (Москва, UTC+3)
-MSK_TZ = ZoneInfo("Europe/Moscow")
+# Московское время (UTC+3)
+MSK_TZ = timezone(timedelta(hours=3))
 
 # ── Утилиты ──────────────────────────────────────────────────────────────────
 
@@ -57,12 +56,10 @@ def fmt_dt(v: Optional[datetime | str]) -> str:
     if v.tzinfo is None:
         v = v.replace(tzinfo=timezone.utc)
     
-    # Переводим в московское время
     v = v.astimezone(MSK_TZ)
     return v.strftime("%d.%m.%Y %H:%M")
 
 def fetch_one(query) -> Optional[dict]:
-    """Безопасное извлечение одной записи из Supabase."""
     try:
         res = query.execute()
         return res.data[0] if res.data else None
@@ -71,14 +68,12 @@ def fetch_one(query) -> Optional[dict]:
         return None
 
 async def safe_answer(cq: CallbackQuery, text: str = None, show_alert: bool = False):
-    """Безопасный ответ на callback, чтобы не было ошибок таймаута."""
     try:
         await cq.answer(text, show_alert=show_alert)
     except Exception:
         pass
 
 def validate_init_data(init_data: str) -> Optional[dict]:
-    """Проверка подписи Telegram WebApp initData."""
     try:
         parsed = dict(parse_qsl(init_data, keep_blank_values=True))
         if "hash" not in parsed:
@@ -94,20 +89,15 @@ def validate_init_data(init_data: str) -> Optional[dict]:
     except Exception:
         return None
 
-# ── FastAPI Зависимости ──────────────────────────────────────────────────────
-
 async def get_verified_user(x_telegram_init_data: str = Header(None)) -> dict:
     if not x_telegram_init_data:
         raise HTTPException(status_code=401, detail="initData required")
-    
     user = validate_init_data(x_telegram_init_data)
     if not user or not user.get("id"):
         raise HTTPException(status_code=401, detail="invalid initData")
-    
     db_user = fetch_one(supabase.table("users").select("status").eq("id", user["id"]))
     if not db_user or db_user.get("status") != "approved":
         raise HTTPException(status_code=403, detail="access denied")
-    
     return user
 
 # ── База данных ──────────────────────────────────────────────────────────────
@@ -116,24 +106,19 @@ def ensure_user(user: types.User) -> dict:
     existing = fetch_one(supabase.table("users").select("*").eq("id", user.id))
     if existing:
         return existing
-    
     status = "approved" if user.id == ADMIN_ID else "pending"
     new_user = {
-        "id": user.id,
-        "first_name": user.first_name,
-        "last_name": user.last_name,
-        "username": user.username,
+        "id": user.id, "first_name": user.first_name,
+        "last_name": user.last_name, "username": user.username,
         "status": status,
     }
     supabase.table("users").insert(new_user).execute()
     return new_user
 
 def create_access_request(user_id: int) -> tuple[dict, bool]:
-    """Создает заявку. Возвращает (заявка, is_new)."""
     existing = fetch_one(supabase.table("access_requests").select("*").eq("user_id", user_id).eq("status", "pending"))
     if existing:
         return existing, False
-    
     res = supabase.table("access_requests").insert({"user_id": user_id, "status": "pending"}).execute()
     return res.data[0], True
 
@@ -141,18 +126,12 @@ def update_request_status(request_id: int, status: str, admin_id: int) -> Option
     req = fetch_one(supabase.table("access_requests").select("*").eq("id", request_id))
     if not req or req["status"] != "pending":
         return None
-    
     supabase.table("access_requests").update({
-        "status": status, 
-        "resolved_at": now_utc().isoformat(), 
-        "resolved_by": admin_id,
+        "status": status, "resolved_at": now_utc().isoformat(), "resolved_by": admin_id,
     }).eq("id", request_id).eq("status", "pending").execute()
-    
     supabase.table("users").update({
-        "status": status, 
-        "updated_at": now_utc().isoformat(),
+        "status": status, "updated_at": now_utc().isoformat(),
     }).eq("id", req["user_id"]).execute()
-    
     return fetch_one(supabase.table("access_requests").select("*").eq("id", request_id))
 
 def get_owner_by_connection(connection_id: str) -> Optional[int]:
@@ -161,25 +140,17 @@ def get_owner_by_connection(connection_id: str) -> Optional[int]:
 
 def upsert_chat(connection_id: str, chat: types.Chat, owner_id: int):
     supabase.table("chats").upsert({
-        "connection_id": connection_id,
-        "chat_id": chat.id,
-        "chat_type": str(chat.type),
-        "title": chat.title,
-        "username": chat.username,
-        "first_name": chat.first_name,
-        "last_name": chat.last_name,
-        "owner_id": owner_id,
+        "connection_id": connection_id, "chat_id": chat.id, "chat_type": str(chat.type),
+        "title": chat.title, "username": chat.username, "first_name": chat.first_name,
+        "last_name": chat.last_name, "owner_id": owner_id,
     }, on_conflict="connection_id,chat_id").execute()
 
 def upsert_contact(owner_id: int, chat: types.Chat):
     if str(chat.type) != "private":
         return
     supabase.table("contacts").upsert({
-        "owner_id": owner_id,
-        "telegram_user_id": chat.id,
-        "first_name": chat.first_name,
-        "last_name": chat.last_name,
-        "username": chat.username,
+        "owner_id": owner_id, "telegram_user_id": chat.id, "first_name": chat.first_name,
+        "last_name": chat.last_name, "username": chat.username,
     }, on_conflict="owner_id,telegram_user_id").execute()
 
 # ── Aiogram: Пользователи ────────────────────────────────────────────────────
@@ -202,15 +173,10 @@ async def get_instruction_msg():
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(
-                text="Скопировать @", 
-                copy_text=types.CopyTextButton(text=f"@{bot_username}")
-            ),
+            InlineKeyboardButton(text="Скопировать @", copy_text=types.CopyTextButton(text=f"@{bot_username}")),
             InlineKeyboardButton(text="🔌 Подключить Историю", url="tg://settings/edit")
         ],
-        [
-            InlineKeyboardButton(text="? Инструкция", callback_data="show_instructions")
-        ]
+        [InlineKeyboardButton(text="? Инструкция", callback_data="show_instructions")]
     ])
     return text, kb
 
@@ -223,9 +189,7 @@ async def cmd_start(message: types.Message):
         "👋 Добро пожаловать в «Историю»!\n"
         "🕰️ История — ваш помощник для сохранения доступной истории сообщений "
         "и отслеживания удалений.\n👨‍💻 Создатель: Khamoi\n\n"
-        "Для начала нажмите кнопку ниже.", 
-        reply_markup=kb
-    )
+        "Для начала нажмите кнопку ниже.", reply_markup=kb)
 
 @dp.callback_query(F.data == "start_usage")
 async def cb_start_usage(cq: CallbackQuery):
@@ -240,7 +204,6 @@ async def cb_start_usage(cq: CallbackQuery):
         text, kb = await get_instruction_msg()
         await cq.message.answer(text, reply_markup=kb)
         return
-        
     if user["status"] in ("denied", "blocked"):
         await cq.message.answer("❌ Доступ запрещён.")
         return
@@ -270,10 +233,9 @@ async def cb_start_usage(cq: CallbackQuery):
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Перейти в диалог", url=f"tg://user?id={cq.from_user.id}")],
- if        [InlineKeyboardButton(text="🟢 Раз notрешить upd", callback_data=f"approve:{req['id']}"),
+        [InlineKeyboardButton(text="🟢 Разрешить", callback_data=f"approve:{req['id']}"),
          InlineKeyboardButton(text="🔴 Запретить", callback_data=f"deny:{req['id']}")],
     ])
-    
     try:
         await bot.send_message(ADMIN_ID, text, reply_markup=kb)
     except Exception as e:
@@ -293,21 +255,17 @@ async def cb_approve(cq: CallbackQuery):
     if cq.from_user.id != ADMIN_ID:
         await safe_answer(cq, "Недостаточно прав", show_alert=True)
         return
-        
     req_id = int(cq.data.split(":")[1])
     upd = update_request_status(req_id, "approved", cq.from_user.id)
-   :
+    if not upd:
         await safe_answer(cq, "Заявка уже обработана", show_alert=True)
         return
-        
     await safe_answer(cq, "Одобрено")
-    
     text, kb = await get_instruction_msg()
     try:
         await bot.send_message(upd["user_id"], text, reply_markup=kb)
     except Exception as e:
         logger.error(f"failed to send instructions: {e}")
-        
     await cq.message.edit_reply_markup(reply_markup=None)
 
 @dp.callback_query(F.data.startswith("deny:"))
@@ -315,13 +273,11 @@ async def cb_deny(cq: CallbackQuery):
     if cq.from_user.id != ADMIN_ID:
         await safe_answer(cq, "Недостаточно прав", show_alert=True)
         return
-        
     req_id = int(cq.data.split(":")[1])
     upd = update_request_status(req_id, "denied", cq.from_user.id)
     if not upd:
         await safe_answer(cq, "Заявка уже обработана", show_alert=True)
         return
-        
     await safe_answer(cq, "Отклонено")
     try:
         await bot.send_message(upd["user_id"], "❌ Ваша заявка отклонена администратором.")
@@ -334,10 +290,8 @@ async def cb_deny(cq: CallbackQuery):
 @dp.business_connection()
 async def on_business_connection(conn: types.BusinessConnection):
     supabase.table("business_connections").upsert({
-        "id": conn.id,
-        "owner_id": conn.user.id,
-        "is_enabled": conn.is_enabled,
-        "updated_at": now_utc().isoformat(),
+        "id": conn.id, "owner_id": conn.user.id,
+        "is_enabled": conn.is_enabled, "updated_at": now_utc().isoformat(),
     }, on_conflict="id").execute()
 
     if conn.is_enabled:
@@ -364,15 +318,12 @@ async def on_business_connection(conn: types.BusinessConnection):
 async def on_business_message(msg: types.Message):
     if not msg.business_connection_id:
         return
-        
     owner_id = get_owner_by_connection(msg.business_connection_id)
     if not owner_id:
         return
-        
     upsert_chat(msg.business_connection_id, msg.chat, owner_id)
     upsert_contact(owner_id, msg.chat)
 
-    # Обрабатываем как само сообщение, так и сообщение, на которое ответили
     messages_to_process = [msg]
     if msg.reply_to_message:
         messages_to_process.append(msg.reply_to_message)
@@ -387,16 +338,13 @@ async def on_business_message(msg: types.Message):
             media_type, media_file_id = "video", target_msg.video.file_id
             
         supabase.table("messages").upsert({
-            "connection_id": msg.business_connection_id,
-            "chat_id": target_msg.chat.id,
-            "message_id": target_msg.message_id,
-            "owner_id": owner_id,
+            "connection_id": msg.business_connection_id, "chat_id": target_msg.chat.id,
+            "message_id": target_msg.message_id, "owner_id": owner_id,
             "sender_id": sender.id if sender else None,
             "sender_name": sender.full_name if sender else None,
             "sender_username": sender.username if sender else None,
             "text": target_msg.text or target_msg.caption,
-            "media_type": media_type,
-            "media_file_id": media_file_id,
+            "media_type": media_type, "media_file_id": media_file_id,
             "sent_at": target_msg.date.isoformat() if target_msg.date else None,
         }, on_conflict="connection_id,chat_id,message_id").execute()
         
@@ -415,18 +363,13 @@ async def on_business_message(msg: types.Message):
                             "upsert": "true"
                         }
                     )
-                    
                     mid_row = fetch_one(supabase.table("messages").select("id").eq("connection_id", msg.business_connection_id).eq("chat_id", target_msg.chat.id).eq("message_id", target_msg.message_id))
                     if mid_row:
                         supabase.table("media_files").upsert({
-                            "message_id": mid_row["id"],
-                            "owner_id": owner_id,
-                            "media_type": media_type,
-                            "storage_path": path,
-                            "file_size": file.file_size,
+                            "message_id": mid_row["id"], "owner_id": owner_id,
+                            "media_type": media_type, "storage_path": path, "file_size": file.file_size,
                         }, on_conflict="message_id").execute()
 
-                    # Если это исчезающее медиа, отправляем его в чат
                     if target_msg.message_id != msg.message_id:
                         try:
                             if media_type == "photo":
@@ -435,7 +378,6 @@ async def on_business_message(msg: types.Message):
                                 await bot.send_video(owner_id, media_file_id, caption="🎬 Сохранено исчезающее видео")
                         except Exception as e:
                             logger.warning(f"Could not send TTL media back to owner: {e}")
-
             except Exception as e:
                 logger.warning(f"media save failed: {e}")
 
@@ -443,26 +385,19 @@ async def on_business_message(msg: types.Message):
 async def on_edited_business_message(msg: types.Message):
     if not msg.business_connection_id:
         return
-        
     owner_id = get_owner_by_connection(msg.business_connection_id)
     if not owner_id:
         return
-        
     row = fetch_one(supabase.table("messages").select("id,text").eq("connection_id", msg.business_connection_id).eq("chat_id", msg.chat.id).eq("message_id", msg.message_id))
     if not row:
         return
-        
     old_text, new_text = row.get("text"), (msg.text or msg.caption)
     if old_text == new_text:
         return
-        
     supabase.table("message_versions").insert({
-        "message_id": row["id"],
-        "old_text": old_text,
-        "new_text": new_text,
-        "edited_at": now_utc().isoformat(),
+        "message_id": row["id"], "old_text": old_text,
+        "new_text": new_text, "edited_at": now_utc().isoformat(),
     }).execute()
-    
     supabase.table("messages").update({"text": new_text}).eq("id", row["id"]).execute()
 
 @dp.deleted_business_messages()
@@ -470,22 +405,16 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
     owner_id = get_owner_by_connection(event.business_connection_id)
     if not owner_id:
         return
-        
     event_hash = hashlib.sha256(
         f"{event.business_connection_id}:{event.chat.id}:{','.join(map(str, sorted(event.message_ids)))}".encode()
     ).hexdigest()
-    
     existing = fetch_one(supabase.table("deletion_events").select("id").eq("event_hash", event_hash))
     if existing:
         return
-        
     supabase.table("deletion_events").insert({
-        "connection_id": event.business_connection_id,
-        "chat_id": event.chat.id,
-        "message_ids": list(event.message_ids),
-        "owner_id": owner_id,
-        "detected_at": now_utc().isoformat(),
-        "event_hash": event_hash,
+        "connection_id": event.business_connection_id, "chat_id": event.chat.id,
+        "message_ids": list(event.message_ids), "owner_id": owner_id,
+        "detected_at": now_utc().isoformat(), "event_hash": event_hash,
     }).execute()
     
     parts = []
@@ -495,7 +424,7 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
         if row:
             m = row
             sent = fmt_dt(m.get("sent_at"))
-            # Используем blockquote для красивого оформления цитаты
+            # Используем blockquote для цитаты
             parts.append(
                 f"👤 Отправитель: {m.get('sender_name') or 'Неизвестно'}\n"
                 f"🔗 Username: {m.get('sender_username') or 'Не указан'}\n"
@@ -524,7 +453,6 @@ app = FastAPI(title="История API")
 async def telegram_webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="invalid secret")
-        
     try:
         data = await request.json()
         update = types.Update.model_validate(data)
@@ -532,13 +460,11 @@ async def telegram_webhook(secret: str, request: Request):
     except Exception as e:
         logger.error(f"WEBHOOK ERROR: {e}", exc_info=True)
         err_str = str(e)
-        
         if "query is too old" not in err_str and "response timeout expired" not in err_str:
             try:
                 await bot.send_message(ADMIN_ID, f"⚠️ <b>Ошибка в webhook:</b>\n<code>{err_str}</code>")
             except Exception:
                 pass
-                
     return {"ok": True}
 
 @app.get("/api/me")
@@ -567,33 +493,26 @@ async def api_contacts(q: str = Query(""), user: dict = Depends(get_verified_use
 @app.get("/api/chat/{chat_id}/messages")
 async def api_chat_messages(chat_id: int, user: dict = Depends(get_verified_user)):
     uid = user["id"]
-    
     msgs = supabase.table("messages").select(
         "id,message_id,text,media_type,sent_at,sender_name,sender_username,sender_id"
     ).eq("owner_id", uid).eq("chat_id", chat_id).order("sent_at", desc=True).limit(200).execute()
-    
     versions = []
     if msgs.data:
         ids = [m["id"] for m in msgs.data]
         versions = supabase.table("message_versions").select("*").in_("message_id", ids).execute().data
-        
     dels = supabase.table("deletion_events").select(
         "id,message_ids,detected_at"
     ).eq("owner_id", uid).eq("chat_id", chat_id).order("detected_at", desc=True).limit(100).execute()
-    
     return {"messages": msgs.data, "versions": versions, "deletions": dels.data}
 
 @app.get("/api/chat/{chat_id}/media")
 async def api_chat_media(chat_id: int, user: dict = Depends(get_verified_user)):
     uid = user["id"]
-    
     mids = supabase.table("messages").select("id").eq("owner_id", uid).eq("chat_id", chat_id).execute().data
     if not mids:
         return {"media": []}
-        
     ids = [m["id"] for m in mids]
     files = supabase.table("media_files").select("*").eq("owner_id", uid).in_("message_id", ids).order("created_at", desc=True).limit(100).execute().data
-    
     result = []
     for f in files:
         try:
@@ -601,7 +520,6 @@ async def api_chat_media(chat_id: int, user: dict = Depends(get_verified_user)):
             result.append({**f, "url": signed.get("signedURL") or signed.get("signedUrl")})
         except Exception:
             result.append({**f, "url": None})
-            
     return {"media": result}
 
 @app.delete("/api/history")
