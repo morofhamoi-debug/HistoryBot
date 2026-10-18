@@ -347,8 +347,8 @@ async def on_business_message(msg: types.Message):
         is_ttl = getattr(target_msg, 'ttl_seconds', None) is not None
         is_ephemeral = is_spoiler or is_ttl
         
-        # Если исходящее и исчезающее/однократное — ИГНОРИРУЕМ (не сохраняем)
-        if is_outgoing and is_ephemeral:
+        # Если это ИСХОДЯЩЕЕ сообщение и содержит медиа (фото/видео/гиф) — ИГНОРИРУЕМ
+        if is_outgoing and media_type:
             continue
             
         # Сохраняем в БД
@@ -453,9 +453,12 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
         
         if row:
             m = row
+            # НЕ ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ, ЕСЛИ СООБЩЕНИЕ БЫЛО ОТПРАВЛЕНО ВЛАДЕЛЬЦЕМ
+            if m.get("sender_id") == owner_id:
+                continue
+                
             sent = fmt_dt(m.get("sent_at"))
             
-            # Форматируем юзернейм с обязательным @
             username = m.get('sender_username')
             uname_text = f"@{username}" if username else "Не указан"
             sender_id = m.get('sender_id') or '—'
@@ -470,7 +473,6 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
                 f"🕒 Отправлено: {sent}"
             )
             
-            # Проверяем, есть ли сохраненный медиафайл
             if m.get("media_type"):
                 mf_row = fetch_one(supabase.table("media_files").select("*").eq("message_id", m["id"]))
                 if mf_row:
@@ -478,33 +480,32 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
                         "type": mf_row["media_type"],
                         "path": mf_row["storage_path"]
                     })
-        else:
-            parts.append(f"💬 Сообщение:\n<blockquote>«Содержимое недоступно»</blockquote>\n🆔 ID сообщения: {mid}")
+        # Если row нет — значит это было наше исходящее медиа, которое мы проигнорировали. Молчим.
             
-    text = (
-        "🗑 <b>УДАЛЕНО СООБЩЕНИЕ</b>\n\n" + "\n\n".join(parts) +
-        f"\n\n🗑 Удаление обнаружено: {fmt_dt(now_utc())}"
-    )
-    
-    try:
-        await bot.send_message(owner_id, text)
+    if parts:
+        text = (
+            "🗑 <b>УДАЛЕНО СООБЩЕНИЕ</b>\n\n" + "\n\n".join(parts) +
+            f"\n\n🗑 Удаление обнаружено: {fmt_dt(now_utc())}"
+        )
         
-        # Отправляем прикрепленные медиафайлы
-        for media in media_to_send:
-            try:
-                res = supabase.storage.from_(STORAGE_BUCKET).download(media["path"])
-                input_file = types.BufferedInputFile(res, filename=f"deleted_{media['type']}.jpg")
-                if media["type"] == "photo":
-                    await bot.send_photo(owner_id, input_file, caption="📸 Прикрепленное фото из удаленного сообщения")
-                elif media["type"] == "video":
-                    await bot.send_video(owner_id, input_file, caption="🎬 Прикрепленное видео из удаленного сообщения")
-                elif media["type"] == "animation":
-                    await bot.send_animation(owner_id, input_file, caption="🎬 Прикрепленная GIF из удаленного сообщения")
-            except Exception as e:
-                logger.warning(f"Could not send deleted media: {e}")
-                
-    except Exception:
-        pass
+        try:
+            await bot.send_message(owner_id, text)
+            
+            for media in media_to_send:
+                try:
+                    res = supabase.storage.from_(STORAGE_BUCKET).download(media["path"])
+                    input_file = types.BufferedInputFile(res, filename=f"deleted_{media['type']}.jpg")
+                    if media["type"] == "photo":
+                        await bot.send_photo(owner_id, input_file, caption="📸 Прикрепленное фото из удаленного сообщения")
+                    elif media["type"] == "video":
+                        await bot.send_video(owner_id, input_file, caption="🎬 Прикрепленное видео из удаленного сообщения")
+                    elif media["type"] == "animation":
+                        await bot.send_animation(owner_id, input_file, caption="🎬 Прикрепленная GIF из удаленного сообщения")
+                except Exception as e:
+                    logger.warning(f"Could not send deleted media: {e}")
+                    
+        except Exception:
+            pass
 
 # ── FastAPI ──────────────────────────────────────────────────────────────────
 
@@ -543,12 +544,49 @@ async def api_stats(user: dict = Depends(get_verified_user)):
 @app.get("/api/contacts")
 async def api_contacts(q: str = Query(""), user: dict = Depends(get_verified_user)):
     uid = user["id"]
-    query = supabase.table("contacts").select("*").eq("owner_id", uid)
+    
+    # Получаем все сообщения пользователя для маппинга ID сообщений в ID чатов
+    user_msgs = supabase.table("messages").select("id, chat_id").eq("owner_id", uid).execute()
+    user_msg_ids = [m["id"] for m in user_msgs.data] if user_msgs.data else []
+    msg_to_chat = {m["id"]: m["chat_id"] for m in user_msgs.data} if user_msgs.data else {}
+    
+    active_chat_ids = set()
+    
+    # 1. Чаты с удаленными сообщениями
+    dels = supabase.table("deletion_events").select("chat_id").eq("owner_id", uid).execute()
+    if dels.data:
+        for d in dels.data:
+            active_chat_ids.add(d["chat_id"])
+            
+    # 2. Чаты с сохраненными медиафайлами
+    media = supabase.table("media_files").select("message_id").eq("owner_id", uid).execute()
+    if media.data:
+        for m in media.data:
+            chat_id = msg_to_chat.get(m["message_id"])
+            if chat_id:
+                active_chat_ids.add(chat_id)
+                
+    # 3. Чаты с измененными сообщениями
+    if user_msg_ids:
+        vers_res = supabase.table("message_versions").select("message_id").in_("message_id", user_msg_ids).execute()
+        if vers_res.data:
+            for v in vers_res.data:
+                chat_id = msg_to_chat.get(v["message_id"])
+                if chat_id:
+                    active_chat_ids.add(chat_id)
+                    
+    if not active_chat_ids:
+        return {"contacts": []}
+        
+    active_ids_list = list(active_chat_ids)
+    
+    query = supabase.table("contacts").select("*").eq("owner_id", uid).in_("telegram_user_id", active_ids_list)
     if q:
         filters = f"first_name.ilike.%{q}%,last_name.ilike.%{q}%,username.ilike.%{q}%"
         if q.isdigit():
             filters += f",telegram_user_id.eq.{q}"
         query = query.or_(filters)
+        
     return {"contacts": query.order("created_at", desc=True).limit(100).execute().data}
 
 @app.get("/api/chat/{chat_id}/messages")
