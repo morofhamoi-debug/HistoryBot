@@ -334,6 +334,7 @@ async def on_business_message(msg: types.Message):
         is_outgoing = (sender_id == owner_id)
         is_reply = (target_msg.message_id != msg.message_id)
         
+        # Определяем тип медиа
         media_type = media_file_id = None
         if target_msg.photo:
             media_type, media_file_id = "photo", target_msg.photo[-1].file_id
@@ -342,30 +343,32 @@ async def on_business_message(msg: types.Message):
         elif target_msg.animation:
             media_type, media_file_id = "animation", target_msg.animation.file_id
             
+        # Флаги TTL и Spoiler
         is_spoiler = getattr(target_msg, 'has_media_spoiler', False)
         is_ttl = getattr(target_msg, 'ttl_seconds', None) is not None
         is_ephemeral = is_spoiler or is_ttl
-        
+
+        # ИСХОДЯЩИЕ МЕДИА ИГНОРИРУЕМ
         if is_outgoing and media_type:
             continue
 
+        # Ищем запись в БД (если это ответ на сообщение)
         db_msg = None
         if is_reply:
             db_msg = fetch_one(supabase.table("messages").select("id, media_file_id").eq("connection_id", msg.business_connection_id).eq("chat_id", target_msg.chat.id).eq("message_id", target_msg.message_id))
-        
+
         was_saved_ephemeral = False
         if db_msg and db_msg.get("media_file_id") == "EPHEMERAL":
             was_saved_ephemeral = True
 
         is_known_ephemeral = is_ephemeral or was_saved_ephemeral
 
-        if is_reply:
-            if media_type and not is_known_ephemeral:
-                continue
-        else:
-            if media_type and not is_known_ephemeral:
-                continue
+        # ФИЛЬТРАЦИЯ
+        if media_type and not is_known_ephemeral:
+            # Если это медиа и мы не знаем, что оно исчезающее — игнорируем
+            continue
 
+        # СОХРАНЯЕМ В БД (все, что прошло фильтр)
         payload = {
             "connection_id": msg.business_connection_id, "chat_id": target_msg.chat.id,
             "message_id": target_msg.message_id, "owner_id": owner_id,
@@ -379,6 +382,7 @@ async def on_business_message(msg: types.Message):
         }
         supabase.table("messages").upsert(payload, on_conflict="connection_id,chat_id,message_id").execute()
         
+        # Скачиваем медиа
         if media_file_id and media_type in ("photo", "video", "animation"):
             if is_known_ephemeral:
                 try:
@@ -404,6 +408,7 @@ async def on_business_message(msg: types.Message):
                                 "media_type": media_type, "storage_path": path, "file_size": file.file_size,
                             }, on_conflict="message_id").execute()
 
+                        # Отправляем в чат, если это ответ на входящее
                         if is_reply and not is_outgoing:
                             try:
                                 if media_type == "photo":
