@@ -418,17 +418,46 @@ async def on_edited_business_message(msg: types.Message):
     owner_id = get_owner_by_connection(msg.business_connection_id)
     if not owner_id:
         return
-    row = fetch_one(supabase.table("messages").select("id,text").eq("connection_id", msg.business_connection_id).eq("chat_id", msg.chat.id).eq("message_id", msg.message_id))
+        
+    # Извлекаем данные отправителя для уведомления
+    row = fetch_one(supabase.table("messages").select("id,text,sender_id,sender_name,sender_username").eq("connection_id", msg.business_connection_id).eq("chat_id", msg.chat.id).eq("message_id", msg.message_id))
     if not row:
         return
+        
     old_text, new_text = row.get("text"), (msg.text or msg.caption)
     if old_text == new_text:
         return
+        
+    # Сохраняем в историю версий
     supabase.table("message_versions").insert({
         "message_id": row["id"], "old_text": old_text,
         "new_text": new_text, "edited_at": now_utc().isoformat(),
     }).execute()
+    
+    # Обновляем основной текст
     supabase.table("messages").update({"text": new_text}).eq("id", row["id"]).execute()
+    
+    # Отправляем уведомление, только если это сообщение собеседника
+    sender_id = row.get("sender_id")
+    if sender_id != owner_id:
+        sender_name = row.get("sender_name") or "Неизвестно"
+        username = row.get("sender_username")
+        uname_text = f"@{username}" if username else "Не указан"
+        
+        text = (
+            f"✏️ <b>СООБЩЕНИЕ ИЗМЕНЕНО</b>\n\n"
+            f"👤 Отправитель: {sender_name}\n"
+            f"🔗 Username: {uname_text}\n"
+            f"🆔 Telegram ID: <code>{sender_id}</code>\n\n"
+            f"Было:\n"
+            f"<blockquote>«{old_text or 'Содержимое недоступно'}»</blockquote>\n"
+            f"Стало:\n"
+            f"<blockquote>«{new_text or 'Содержимое недоступно'}»</blockquote>"
+        )
+        try:
+            await bot.send_message(owner_id, text)
+        except Exception as e:
+            logger.warning(f"Could not send edit notify: {e}")
 
 @dp.deleted_business_messages()
 async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
