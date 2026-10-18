@@ -119,7 +119,12 @@ async def cmd_start(message: types.Message):
 @dp.callback_query(F.data == "start_usage")
 async def cb_start_usage(cq: CallbackQuery):
     await cq.answer()
-    user = ensure_user(cq.from_user)
+    try:
+        user = ensure_user(cq.from_user)
+    except Exception as e:
+        await cq.message.answer(f"⚠️ <b>Ошибка базы данных Supabase:</b>\n<code>{str(e)}</code>")
+        return
+        
     if user["status"] == "approved":
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="📱 Открыть Историю", web_app=types.WebAppInfo(url=MINI_APP_URL))]])
@@ -129,7 +134,13 @@ async def cb_start_usage(cq: CallbackQuery):
         await cq.message.answer("⏳ Ваша заявка уже ожидает решения администратора."); return
     if user["status"] in ("denied", "blocked"):
         await cq.message.answer("❌ Доступ запрещён."); return
-    req = create_access_request(user["id"])
+        
+    try:
+        req = create_access_request(user["id"])
+    except Exception as e:
+        await cq.message.answer(f"⚠️ <b>Ошибка при создании заявки:</b>\n<code>{str(e)}</code>")
+        return
+
     await cq.message.answer("📨 Заявка отправлена администратору. Ожидайте решения.")
     uname = f"@{cq.from_user.username}" if cq.from_user.username else "отсутствует"
     text = (f"🔔 <b>НОВАЯ ЗАЯВКА</b>\n"
@@ -285,9 +296,16 @@ app = FastAPI(title="История")
 @app.post("/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET: raise HTTPException(403, "invalid secret")
-    data = await request.json()
-    update = types.Update.model_validate(data)
-    await dp.feed_update(bot, update)
+    try:
+        data = await request.json()
+        update = types.Update.model_validate(data)
+        await dp.feed_update(bot, update)
+    except Exception as e:
+        logger.error(f"WEBHOOK ERROR: {e}", exc_info=True)
+        try:
+            await bot.send_message(ADMIN_ID, f"⚠️ <b>Ошибка в webhook:</b>\n<code>{str(e)}</code>")
+        except Exception:
+            pass
     return {"ok": True}
 
 @app.get("/api/me")
