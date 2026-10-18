@@ -388,17 +388,19 @@ async def on_business_message(msg: types.Message):
                             "media_type": media_type, "storage_path": path, "file_size": file.file_size,
                         }, on_conflict="message_id").execute()
 
-                    # Отправляем в чат, ТОЛЬКО если это ответ на входящее ИСЧЕЗАЮЩЕЕ/ОДНОКРАТНОЕ
-                    if target_msg.message_id != msg.message_id and not is_outgoing and is_ephemeral:
+                    # Отправляем в чат, если это ответ на входящее сообщение (убираем строгую проверку is_ephemeral, так как Telegram часто не передает флаги в reply_to_message)
+                    if target_msg.message_id != msg.message_id and not is_outgoing:
                         try:
                             if media_type == "photo":
-                                prefix = "📸 Сохранено "
-                                prefix += "однократное фото" if is_spoiler else "исчезающее фото"
+                                prefix = "📸 Сохранено фото"
+                                if is_spoiler: prefix = "📸 Сохранено однократное фото"
+                                elif is_ttl: prefix = "📸 Сохранено исчезающее фото"
                                 input_file = types.BufferedInputFile(file_bytes, filename="photo.jpg")
                                 await bot.send_photo(owner_id, input_file, caption=prefix)
                             elif media_type == "video":
-                                prefix = "🎬 Сохранено "
-                                prefix += "однократное видео" if is_spoiler else "исчезающее видео"
+                                prefix = "🎬 Сохранено видео"
+                                if is_spoiler: prefix = "🎬 Сохранено однократное видео"
+                                elif is_ttl: prefix = "🎬 Сохранено исчезающее видео"
                                 input_file = types.BufferedInputFile(file_bytes, filename="video.mp4")
                                 await bot.send_video(owner_id, input_file, caption=prefix)
                             elif media_type == "animation":
@@ -433,32 +435,23 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
     owner_id = get_owner_by_connection(event.business_connection_id)
     if not owner_id:
         return
-    event_hash = hashlib.sha256(
-        f"{event.business_connection_id}:{event.chat.id}:{','.join(map(str, sorted(event.message_ids)))}".encode()
-    ).hexdigest()
-    existing = fetch_one(supabase.table("deletion_events").select("id").eq("event_hash", event_hash))
-    if existing:
-        return
-    supabase.table("deletion_events").insert({
-        "connection_id": event.business_connection_id, "chat_id": event.chat.id,
-        "message_ids": list(event.message_ids), "owner_id": owner_id,
-        "detected_at": now_utc().isoformat(), "event_hash": event_hash,
-    }).execute()
-    
+        
     parts = []
     media_to_send = [] 
+    valid_message_ids = []
     
     for mid in event.message_ids:
         row = fetch_one(supabase.table("messages").select("*").eq("connection_id", event.business_connection_id).eq("chat_id", event.chat.id).eq("message_id", mid))
         
         if row:
             m = row
-            # НЕ ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ, ЕСЛИ СООБЩЕНИЕ БЫЛО ОТПРАВЛЕНО ВЛАДЕЛЬЦЕМ
+            # ПОЛНОСТЬЮ ИГНОРИРУЕМ УДАЛЕНИЕ СВОИХ СООБЩЕНИЙ
             if m.get("sender_id") == owner_id:
                 continue
                 
-            sent = fmt_dt(m.get("sent_at"))
+            valid_message_ids.append(mid)
             
+            sent = fmt_dt(m.get("sent_at"))
             username = m.get('sender_username')
             uname_text = f"@{username}" if username else "Не указан"
             sender_id = m.get('sender_id') or '—'
@@ -480,7 +473,23 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
                         "type": mf_row["media_type"],
                         "path": mf_row["storage_path"]
                     })
-        # Если row нет — значит это было наше исходящее медиа, которое мы проигнорировали. Молчим.
+                    
+    # Если валидных сообщений нет (удалены только свои), ничего не сохраняем и не шлем
+    if not valid_message_ids:
+        return
+        
+    event_hash = hashlib.sha256(
+        f"{event.business_connection_id}:{event.chat.id}:{','.join(map(str, sorted(valid_message_ids)))}".encode()
+    ).hexdigest()
+    existing = fetch_one(supabase.table("deletion_events").select("id").eq("event_hash", event_hash))
+    if existing:
+        return
+        
+    supabase.table("deletion_events").insert({
+        "connection_id": event.business_connection_id, "chat_id": event.chat.id,
+        "message_ids": valid_message_ids, "owner_id": owner_id,
+        "detected_at": now_utc().isoformat(), "event_hash": event_hash,
+    }).execute()
             
     if parts:
         text = (
@@ -616,6 +625,10 @@ async def api_chat_messages(chat_id: int, user: dict = Depends(get_verified_user
     
     filtered_msgs = []
     for m in all_msgs:
+        # Игнорируем свои сообщения в истории
+        if m.get("sender_id") == uid:
+            continue
+            
         is_deleted = m["message_id"] in deleted_telegram_ids
         is_edited = m["id"] in edited_db_ids
         
