@@ -367,6 +367,7 @@ async def cb_term_menu(cq: CallbackQuery):
     
     await cq.message.edit_text(text, reply_markup=kb)
 
+# ИЗМЕНЕНО: Умное добавление дней и отправка уведомления
 @dp.callback_query(F.data.startswith("term_set:"))
 async def cb_term_set(cq: CallbackQuery):
     if cq.from_user.id != ADMIN_ID: return
@@ -377,21 +378,66 @@ async def cb_term_set(cq: CallbackQuery):
     days = int(parts[2])
     target_type = parts[3]
     
-    valid_until = None
-    if days > 0:
-        valid_until = (now_utc() + timedelta(days=days)).isoformat()
+    # Определяем ID пользователя (из заявки или напрямую)
+    user_id = target_id
+    if target_type != "user":
+        req = fetch_one(supabase.table("access_requests").select("user_id").eq("id", target_id))
+        user_id = req["user_id"] if req else None
         
+    if not user_id:
+        await cq.message.edit_text("Ошибка: пользователь не найден.")
+        return
+
+    # Получаем текущую дату окончания
+    u_data = fetch_one(supabase.table("users").select("valid_until").eq("id", user_id))
+    current_valid = u_data.get("valid_until") if u_data else None
+    
+    valid_until = None
+    is_extending = False
+    
+    if days > 0:
+        now = now_utc()
+        if current_valid:
+            try:
+                curr_dt = datetime.fromisoformat(current_valid.replace("Z", "+00:00"))
+                if curr_dt > now:
+                    # Срок еще активен — прибавляем дни к текущему сроку
+                    valid_until = (curr_dt + timedelta(days=days)).isoformat()
+                    is_extending = True
+                else:
+                    # Срок уже истек — отсчитываем от сегодня
+                    valid_until = (now + timedelta(days=days)).isoformat()
+            except ValueError:
+                valid_until = (now + timedelta(days=days)).isoformat()
+        else:
+            # Срока не было — отсчитываем от сегодня
+            valid_until = (now + timedelta(days=days)).isoformat()
+
+    # Формируем текст уведомления
+    if valid_until:
+        if is_extending:
+            # КУРСИВ для текста добавления, ЖИРНЫЙ для даты
+            user_text = f"<i>Вам добавлено {days} дн. к текущему сроку.</i>\nНовая дата окончания: <b>{fmt_dt(valid_until)}</b>\n\nДля продления в будущем обращайтесь: @GaspardShop"
+        else:
+            user_text = f"✅ <b>Вам установлен срок доступа!</b>\n\nВаш доступ к боту «История» активен до: <b>{fmt_dt(valid_until)}</b>.\n\nПо окончании срока вам потребуется продлить его у администратора (@GaspardShop)."
+    else:
+        user_text = "✅ <b>Вам выдан бессрочный доступ!</b>\n\nДобро пожаловать в «Историю»."
+
     if target_type == "user":
-        # Сбрасываем флаг expiry_notified, если мы выдали новый срок
         supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", target_id).execute()
+        try: await bot.send_message(target_id, user_text)
+        except Exception as e: logger.warning(f"Could not send term notify to {target_id}: {e}")
     else:
         req = fetch_one(supabase.table("access_requests").select("user_id").eq("id", target_id))
         if req:
             supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", req["user_id"]).execute()
             supabase.table("access_requests").update({"status": "approved", "resolved_at": now_utc().isoformat()}).eq("id", target_id).execute()
+            
             text, kb = await get_instruction_msg()
-            try: await bot.send_message(req["user_id"], text, reply_markup=kb)
-            except Exception: pass
+            try: 
+                await bot.send_message(req["user_id"], text, reply_markup=kb)
+                await bot.send_message(req["user_id"], user_text)
+            except Exception as e: logger.warning(f"Could not send term notify to {req['user_id']}: {e}")
 
     await cq.message.edit_text("✅ Срок успешно установлен.")
     await asyncio.sleep(1.5)
@@ -411,6 +457,7 @@ async def cb_term_manual(cq: CallbackQuery, state: FSMContext):
     
     await cq.message.edit_text("✍️ Отправьте дату и время в формате:\n<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\nПример: <code>31.12.2026 23:59</code>")
 
+# ИЗМЕНЕНО: Отправка уведомления при ручном вводе даты
 @dp.message(AdminState.waiting_for_custom_date)
 async def process_custom_date(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
@@ -427,17 +474,29 @@ async def process_custom_date(message: types.Message, state: FSMContext):
     target_type = data["target_type"]
     await state.clear()
     
+    # Текст для пользователя
+    user_text = f"✅ <b>Вам установлен срок доступа!</b>\n\nВаш доступ к боту «История» активен до: <b>{fmt_dt(valid_until)}</b>.\n\nПо окончании срока вам потребуется продлить его у администратора (@GaspardShop)."
+    
     if target_type == "user":
         supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", target_id).execute()
+        # Отправляем уведомление пользователю
+        try: await bot.send_message(target_id, user_text)
+        except Exception as e: logger.warning(f"Could not send term notify to {target_id}: {e}")
+        
         await message.answer(f"✅ Срок установлен до: {fmt_dt(valid_until)}")
     else:
         req = fetch_one(supabase.table("access_requests").select("user_id").eq("id", target_id))
         if req:
             supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", req["user_id"]).execute()
             supabase.table("access_requests").update({"status": "approved", "resolved_at": now_utc().isoformat()}).eq("id", target_id).execute()
+            
+            # Отправляем инструкцию и следом уведомление о сроке
             text, kb = await get_instruction_msg()
-            try: await bot.send_message(req["user_id"], text, reply_markup=kb)
-            except Exception: pass
+            try: 
+                await bot.send_message(req["user_id"], text, reply_markup=kb)
+                await bot.send_message(req["user_id"], user_text)
+            except Exception as e: logger.warning(f"Could not send term notify to {req['user_id']}: {e}")
+            
         await message.answer(f"✅ Пользователь одобрен, срок до: {fmt_dt(valid_until)}")
 
 # ── Стандартные команды ──────────────────────────────────────────────────────
