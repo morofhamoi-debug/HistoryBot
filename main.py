@@ -230,7 +230,7 @@ async def get_instruction_msg():
         bot_username = "KhamoiHistory_Bot"
 
     text = (
-        "✅ <b>Доступ открыт. Добро пожаловать в «Историю»!</b>\n\n"
+        "✅ <b>Доступ открыт. Добро пожаловать в «Глазок»!</b>\n\n"
         "<b>Бот не подключён</b>\n"
         "После подключения покажет удаленные и отредактированные сообщения.\n"
         "Для сохранения сгорающих или однократных — ответьте на них любым сообщением.\n\n"
@@ -241,7 +241,7 @@ async def get_instruction_msg():
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="Скопировать @", copy_text=types.CopyTextButton(text=f"@{bot_username}")),
-            InlineKeyboardButton(text="🔌 Подключить Историю", url="tg://settings/edit")
+            InlineKeyboardButton(text="🔌 Подключить Глазок", url="tg://settings/edit")
         ],
         [InlineKeyboardButton(text="? Инструкция", callback_data="show_instructions")]
     ])
@@ -419,9 +419,9 @@ async def cb_term_set(cq: CallbackQuery):
             # КУРСИВ для текста добавления, ЖИРНЫЙ для даты
             user_text = f"<i>Вам добавлено {days} дн. к текущему сроку.</i>\nНовая дата окончания: <b>{fmt_dt(valid_until)}</b>\n\nДля продления в будущем обращайтесь: @GaspardShop"
         else:
-            user_text = f"✅ <b>Вам установлен срок доступа!</b>\n\nВаш доступ к боту «История» активен до: <b>{fmt_dt(valid_until)}</b>.\n\nПо окончании срока вам потребуется продлить его у администратора (@GaspardShop)."
+            user_text = f"✅ <b>Вам установлен срок доступа!</b>\n\nВаш доступ к боту «Глазок» активен до: <b>{fmt_dt(valid_until)}</b>.\n\nПо окончании срока вам потребуется продлить его у администратора (@GaspardShop)."
     else:
-        user_text = "✅ <b>Вам выдан бессрочный доступ!</b>\n\nДобро пожаловать в «Историю»."
+        user_text = "✅ <b>Вам выдан бессрочный доступ!</b>\n\nДобро пожаловать в «Глазок»."
 
     if target_type == "user":
         supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", target_id).execute()
@@ -475,7 +475,7 @@ async def process_custom_date(message: types.Message, state: FSMContext):
     await state.clear()
     
     # Текст для пользователя
-    user_text = f"✅ <b>Вам установлен срок доступа!</b>\n\nВаш доступ к боту «История» активен до: <b>{fmt_dt(valid_until)}</b>.\n\nПо окончании срока вам потребуется продлить его у администратора (@GaspardShop)."
+    user_text = f"✅ <b>Вам установлен срок доступа!</b>\n\nВаш доступ к боту «Глазок» активен до: <b>{fmt_dt(valid_until)}</b>.\n\nПо окончании срока вам потребуется продлить его у администратора (@GaspardShop)."
     
     if target_type == "user":
         supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", target_id).execute()
@@ -507,7 +507,7 @@ async def cmd_start(message: types.Message):
         [InlineKeyboardButton(text="✅ Начать пользоваться", callback_data="start_usage")]
     ])
     await message.answer(
-        "👋 Добро пожаловать в «Историю»!\n"
+        "👋 Добро пожаловать в «Глазок»!\n"
         "🕰️ История — ваш помощник для сохранения доступной истории сообщений "
         "и отслеживания удалений.\n👨‍💻 Создатель: Khamoi\n\n"
         "Для начала нажмите кнопку ниже.", reply_markup=kb)
@@ -581,7 +581,7 @@ async def cb_start_usage(cq: CallbackQuery):
 async def cb_show_instructions(cq: CallbackQuery):
     text = (
         "1. Нажмите кнопку \"Скопировать @\".\n"
-        "2. Нажмите кнопку \"🔌 Подключить Историю\"\n"
+        "2. Нажмите кнопку \"🔌 Подключить Глазок\"\n"
         "3. Выберите \"Автоматизация чатов\" и вставьте скопированный юзернейм."
     )
     await safe_answer(cq, text, show_alert=True)
@@ -632,13 +632,13 @@ async def on_business_connection(conn: types.BusinessConnection):
 
     if conn.is_enabled:
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📱 Открыть Историю", web_app=types.WebAppInfo(url=MINI_APP_URL))]
+            [InlineKeyboardButton(text="📱 Открыть Глазок", web_app=types.WebAppInfo(url=MINI_APP_URL))]
         ])
         text = (
             "✅ <b>Бот успешно подключён к автоматизации чатов!</b>\n\n"
             "Теперь я буду сохранять историю сообщений и присылать уведомления, "
             "если собеседник удалит или изменит сообщение.\n\n"
-            "Все сохранённые данные доступны в приложении «История»."
+            "Все сохранённые данные доступны в приложении «Глазок»."
         )
         try:
             await bot.send_message(conn.user.id, text, reply_markup=kb)
