@@ -32,6 +32,10 @@ WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 MINI_APP_URL = os.environ["MINI_APP_URL"]
 STORAGE_BUCKET = os.environ.get("STORAGE_BUCKET", "history-media")
 
+# ⚠️ ССЫЛКИ НА ТВОИ КАРТИНКИ С GITHUB ⚠️
+START_IMG_URL = "https://raw.githubusercontent.com/morofhamoi-debug/HistoryBot/main/start.PNG"
+STARTI_IMG_URL = "https://raw.githubusercontent.com/morofhamoi-debug/HistoryBot/main/starti.PNG"
+
 # ── Инициализация ────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("istoriya")
@@ -229,13 +233,12 @@ async def get_instruction_msg():
     except Exception:
         bot_username = "KhamoiHistory_Bot"
 
+    # ИЗМЕНЕНО: Удалены строки, которые ты обвел белым на скриншоте
     text = (
         "✅ <b>Доступ открыт. Добро пожаловать в «Глазок»!</b>\n\n"
         "<b>Бот не подключён</b>\n"
         "После подключения покажет удаленные и отредактированные сообщения.\n"
-        "Для сохранения сгорающих или однократных — ответьте на них любым сообщением.\n\n"
-        "• Бот присылает уведомления, когда собеседник удаляет или редактирует сообщения.\n"
-        "• Может сохранять сгорающие и однократные фото, голосовые и видео."
+        "Для сохранения сгорающих или однократных — ответьте на них любым сообщением."
     )
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -243,7 +246,7 @@ async def get_instruction_msg():
             InlineKeyboardButton(text="Скопировать @", copy_text=types.CopyTextButton(text=f"@{bot_username}")),
             InlineKeyboardButton(text="🔌 Подключить Глазок", url="tg://settings/edit")
         ],
-        [InlineKeyboardButton(text="? Инструкция", callback_data="show_instructions")]
+        [InlineKeyboardButton(text="? Инструкция", callback_data="show_instructions_info")]
     ])
     return text, kb
 
@@ -367,7 +370,7 @@ async def cb_term_menu(cq: CallbackQuery):
     
     await cq.message.edit_text(text, reply_markup=kb)
 
-# ИЗМЕНЕНО: Умное добавление дней и отправка уведомления
+# ИЗМЕНЕНО: Умное добавление дней и отправка уведомления с кнопкой подключения
 @dp.callback_query(F.data.startswith("term_set:"))
 async def cb_term_set(cq: CallbackQuery):
     if cq.from_user.id != ADMIN_ID: return
@@ -423,9 +426,14 @@ async def cb_term_set(cq: CallbackQuery):
     else:
         user_text = "✅ <b>Вам выдан бессрочный доступ!</b>\n\nДобро пожаловать в «Глазок»."
 
+    # Кнопка подключения
+    user_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔌 Подключить Глазок", callback_data="user_connect")]
+    ])
+
     if target_type == "user":
         supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", target_id).execute()
-        try: await bot.send_message(target_id, user_text)
+        try: await bot.send_message(target_id, user_text, reply_markup=user_kb)
         except Exception as e: logger.warning(f"Could not send term notify to {target_id}: {e}")
     else:
         req = fetch_one(supabase.table("access_requests").select("user_id").eq("id", target_id))
@@ -433,10 +441,8 @@ async def cb_term_set(cq: CallbackQuery):
             supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", req["user_id"]).execute()
             supabase.table("access_requests").update({"status": "approved", "resolved_at": now_utc().isoformat()}).eq("id", target_id).execute()
             
-            text, kb = await get_instruction_msg()
             try: 
-                await bot.send_message(req["user_id"], text, reply_markup=kb)
-                await bot.send_message(req["user_id"], user_text)
+                await bot.send_message(req["user_id"], user_text, reply_markup=user_kb)
             except Exception as e: logger.warning(f"Could not send term notify to {req['user_id']}: {e}")
 
     await cq.message.edit_text("✅ Срок успешно установлен.")
@@ -477,10 +483,14 @@ async def process_custom_date(message: types.Message, state: FSMContext):
     # Текст для пользователя
     user_text = f"✅ <b>Вам установлен срок доступа!</b>\n\nВаш доступ к боту «Глазок» активен до: <b>{fmt_dt(valid_until)}</b>.\n\nПо окончании срока вам потребуется продлить его у администратора (@GaspardShop)."
     
+    # Кнопка подключения
+    user_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔌 Подключить Глазок", callback_data="user_connect")]
+    ])
+    
     if target_type == "user":
         supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", target_id).execute()
-        # Отправляем уведомление пользователю
-        try: await bot.send_message(target_id, user_text)
+        try: await bot.send_message(target_id, user_text, reply_markup=user_kb)
         except Exception as e: logger.warning(f"Could not send term notify to {target_id}: {e}")
         
         await message.answer(f"✅ Срок установлен до: {fmt_dt(valid_until)}")
@@ -490,27 +500,61 @@ async def process_custom_date(message: types.Message, state: FSMContext):
             supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", req["user_id"]).execute()
             supabase.table("access_requests").update({"status": "approved", "resolved_at": now_utc().isoformat()}).eq("id", target_id).execute()
             
-            # Отправляем инструкцию и следом уведомление о сроке
-            text, kb = await get_instruction_msg()
             try: 
-                await bot.send_message(req["user_id"], text, reply_markup=kb)
-                await bot.send_message(req["user_id"], user_text)
+                await bot.send_message(req["user_id"], user_text, reply_markup=user_kb)
             except Exception as e: logger.warning(f"Could not send term notify to {req['user_id']}: {e}")
             
         await message.answer(f"✅ Пользователь одобрен, срок до: {fmt_dt(valid_until)}")
 
 # ── Стандартные команды ──────────────────────────────────────────────────────
 
+# ИЗМЕНЕНО: Отправляем starti.PNG при старте
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Начать пользоваться", callback_data="start_usage")]
     ])
-    await message.answer(
+    
+    if message.from_user.id == ADMIN_ID:
+        admin_kb = types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="👥 Пользователи")]],
+            resize_keyboard=True,
+            is_persistent=True
+        )
+        await message.answer("🛠 <b>Режим администратора активирован.</b>", reply_markup=admin_kb)
+
+    caption = (
         "👋 Добро пожаловать в «Глазок»!\n"
         "👁️ Глазок — ваш помощник для сохранения доступной истории сообщений "
         "и отслеживания удалений.\n👨‍💻 Создатель: Khamoi\n\n"
-        "Для начала нажмите кнопку ниже.", reply_markup=kb)
+        "Для начала нажмите кнопку ниже."
+    )
+    
+    try:
+        await message.answer_photo(photo=STARTI_IMG_URL, caption=caption, reply_markup=kb)
+    except Exception as e:
+        logger.error(f"Не удалось отправить фото /start: {e}")
+        await message.answer(caption, reply_markup=kb)
+
+@dp.message(F.text == "👥 Пользователи")
+async def handle_admin_users_btn(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        res = supabase.table("users").select("*").neq("id", ADMIN_ID).order("created_at", desc=True).limit(30).execute()
+        users = res.data if res.data else []
+        if not users:
+            await message.answer("В базе пока нет других пользователей.")
+            return
+        kb_buttons = []
+        for u in users:
+            name = f"{u.get('first_name') or ''} {u.get('last_name') or ''}".strip()
+            if not name: name = str(u['id'])
+            status_emoji = "🟢" if u['status'] == 'approved' else ("⏳" if u['status'] == 'pending' else "🔴")
+            kb_buttons.append([InlineKeyboardButton(text=f"{status_emoji} {name} (ID: {u['id']})", callback_data=f"admin_user:{u['id']}")])
+        kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+        await message.answer(f"👥 <b>Список пользователей</b> (найдено: {len(users)})", reply_markup=kb)
+    except Exception as e:
+        await message.answer(f"⚠️ <b>Ошибка при загрузке списка:</b>\n<code>{str(e)}</code>")
 
 @dp.callback_query(F.data == "start_usage")
 async def cb_start_usage(cq: CallbackQuery):
@@ -522,7 +566,6 @@ async def cb_start_usage(cq: CallbackQuery):
         return
         
     if user["status"] == "approved":
-        # Проверка срока
         if user.get("valid_until"):
             try:
                 v_until = datetime.fromisoformat(user["valid_until"].replace("Z", "+00:00"))
@@ -534,7 +577,10 @@ async def cb_start_usage(cq: CallbackQuery):
                 pass
                 
         text, kb = await get_instruction_msg()
-        await cq.message.answer(text, reply_markup=kb)
+        try:
+            await cq.message.answer_photo(photo=START_IMG_URL, caption=text, reply_markup=kb)
+        except Exception:
+            await cq.message.answer(text, reply_markup=kb)
         return
     if user["status"] in ("denied", "blocked"):
         await cq.message.answer("❌ Доступ запрещён.")
@@ -564,12 +610,10 @@ async def cb_start_usage(cq: CallbackQuery):
         "📌 Статус: Ожидает рассмотрения"
     )
     
-    # ТВОЙ ЭСКИЗ (Разрешить/Запретить сверху, Срок снизу)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Перейти в диалог", url=f"tg://user?id={cq.from_user.id}")],
         [InlineKeyboardButton(text="🟢 Разрешить", callback_data=f"approve:{req['id']}"),
-         InlineKeyboardButton(text="🔴 Запретить", callback_data=f"deny:{req['id']}")],
-        [InlineKeyboardButton(text="📅 Срок", callback_data=f"term_menu:{req['id']}:req")]
+         InlineKeyboardButton(text="🔴 Запретить", callback_data=f"deny:{req['id']}")]
     ])
     
     try:
@@ -577,8 +621,8 @@ async def cb_start_usage(cq: CallbackQuery):
     except Exception as e:
         logger.error("admin notify failed: %s", e)
 
-@dp.callback_query(F.data == "show_instructions")
-async def cb_show_instructions(cq: CallbackQuery):
+@dp.callback_query(F.data == "show_instructions_info")
+async def cb_show_instructions_info(cq: CallbackQuery):
     text = (
         "1. Нажмите кнопку \"Скопировать @\".\n"
         "2. Нажмите кнопку \"🔌 Подключить Глазок\"\n"
@@ -586,23 +630,42 @@ async def cb_show_instructions(cq: CallbackQuery):
     )
     await safe_answer(cq, text, show_alert=True)
 
+# ИЗМЕНЕНО: При нажатии на кнопку подключения удаляем старое сообщение и присылаем фото с инструкцией
+@dp.callback_query(F.data == "user_connect")
+async def cb_user_connect(cq: CallbackQuery):
+    await safe_answer(cq)
+    text, kb = await get_instruction_msg()
+    
+    try: await cq.message.delete()
+    except Exception: pass
+    
+    try:
+        await cq.message.answer_photo(photo=START_IMG_URL, caption=text, reply_markup=kb)
+    except Exception as e:
+        logger.warning(f"Could not send instruction photo: {e}")
+        await cq.message.answer(text, reply_markup=kb)
+
+# ИЗМЕНЕНО: При нажатии "Разрешить" удаляем сообщение с заявкой и показываем меню сроков
 @dp.callback_query(F.data.startswith("approve:"))
 async def cb_approve(cq: CallbackQuery):
     if cq.from_user.id != ADMIN_ID:
         await safe_answer(cq, "Недостаточно прав", show_alert=True)
         return
     req_id = int(cq.data.split(":")[1])
-    upd = update_request_status(req_id, "approved", cq.from_user.id)
-    if not upd:
-        await safe_answer(cq, "Заявка уже обработана", show_alert=True)
-        return
-    await safe_answer(cq, "Одобрено")
-    text, kb = await get_instruction_msg()
-    try:
-        await bot.send_message(upd["user_id"], text, reply_markup=kb)
-    except Exception as e:
-        logger.error(f"failed to send instructions: {e}")
-    await cq.message.delete()
+    
+    try: await cq.message.delete()
+    except Exception: pass
+    
+    text = "📅 <b>Выберите срок действия</b>\nНа сколько выдать доступ?"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 день", callback_data=f"term_set:{req_id}:1:req"),
+         InlineKeyboardButton(text="7 дней", callback_data=f"term_set:{req_id}:7:req")],
+        [InlineKeyboardButton(text="30 дней", callback_data=f"term_set:{req_id}:30:req"),
+         InlineKeyboardButton(text="Навсегда", callback_data=f"term_set:{req_id}:0:req")],
+        [InlineKeyboardButton(text="✍️ Ввести вручную", callback_data=f"term_manual:{req_id}:req")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]
+    ])
+    await cq.message.answer(text, reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("deny:"))
 async def cb_deny(cq: CallbackQuery):
@@ -631,9 +694,7 @@ async def on_business_connection(conn: types.BusinessConnection):
     }, on_conflict="id").execute()
 
     if conn.is_enabled:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📱 Открыть Глазок", web_app=types.WebAppInfo(url=MINI_APP_URL))]
-        ])
+        # УБРАНА ИНЛАЙН КНОПКА ОТКРЫТИЯ МИНИ ЭП
         text = (
             "✅ <b>Бот успешно подключён к автоматизации чатов!</b>\n\n"
             "Теперь я буду сохранять историю сообщений и присылать уведомления, "
@@ -641,7 +702,7 @@ async def on_business_connection(conn: types.BusinessConnection):
             "Все сохранённые данные доступны в приложении «Глазок»."
         )
         try:
-            await bot.send_message(conn.user.id, text, reply_markup=kb)
+            await bot.send_message(conn.user.id, text)
         except Exception as e:
             logger.error(f"Failed to send business connection notify: {e}")
     else:
@@ -658,7 +719,6 @@ async def on_business_message(msg: types.Message):
     if not owner_id:
         return
         
-    # ДОБАВЛЕНА ПРОВЕРКА
     if not is_user_active(owner_id):
         return
         
@@ -674,7 +734,6 @@ async def on_business_message(msg: types.Message):
         sender_id = sender.id if sender else None
         is_outgoing = (sender_id == owner_id)
         
-        # Определяем тип медиа
         media_type = media_file_id = None
         if target_msg.photo:
             media_type, media_file_id = "photo", target_msg.photo[-1].file_id
@@ -682,17 +741,16 @@ async def on_business_message(msg: types.Message):
             media_type, media_file_id = "video", target_msg.video.file_id
         elif target_msg.animation:
             media_type, media_file_id = "animation", target_msg.animation.file_id
+        elif target_msg.video_note:
+            media_type, media_file_id = "video_note", target_msg.video_note.file_id
             
-        # Флаги TTL и Spoiler
         is_spoiler = getattr(target_msg, 'has_media_spoiler', False)
         is_ttl = getattr(target_msg, 'ttl_seconds', None) is not None
         is_ephemeral = is_spoiler or is_ttl
         
-        # Если это ИСХОДЯЩЕЕ сообщение и содержит медиа (фото/видео/гиф) — ИГНОРИРУЕМ
         if is_outgoing and media_type:
             continue
             
-        # Сохраняем в БД
         supabase.table("messages").upsert({
             "connection_id": msg.business_connection_id, "chat_id": target_msg.chat.id,
             "message_id": target_msg.message_id, "owner_id": owner_id,
@@ -704,11 +762,10 @@ async def on_business_message(msg: types.Message):
             "sent_at": target_msg.date.isoformat() if target_msg.date else None,
         }, on_conflict="connection_id,chat_id,message_id").execute()
         
-        # Скачиваем медиа, если есть file_id
-        if media_file_id and media_type in ("photo", "video", "animation"):
+        if media_file_id and media_type in ("photo", "video", "animation", "video_note"):
             try:
                 file = await bot.get_file(media_file_id)
-                if file.file_size and file.file_size <= 20 * 1024 * 1024:
+                if (file.file_size or 0) <= 20 * 1024 * 1024:
                     buf = BytesIO()
                     await bot.download_file(file.file_path, buf)
                     file_bytes = buf.getvalue()
@@ -718,7 +775,7 @@ async def on_business_message(msg: types.Message):
                     supabase.storage.from_(STORAGE_BUCKET).upload(
                         path, file_bytes,
                         file_options={
-                            "content-type": "image/jpeg" if media_type == "photo" else ("video/mp4" if media_type == "video" else "video/mp4"),
+                            "content-type": "image/jpeg" if media_type == "photo" else "video/mp4",
                             "upsert": "true"
                         }
                     )
@@ -729,7 +786,6 @@ async def on_business_message(msg: types.Message):
                             "media_type": media_type, "storage_path": path, "file_size": file.file_size,
                         }, on_conflict="message_id").execute()
 
-                    # Отправляем в чат, если это ответ на входящее сообщение
                     if target_msg.message_id != msg.message_id and not is_outgoing:
                         try:
                             if media_type == "photo":
@@ -747,6 +803,10 @@ async def on_business_message(msg: types.Message):
                             elif media_type == "animation":
                                 input_file = types.BufferedInputFile(file_bytes, filename="animation.mp4")
                                 await bot.send_animation(owner_id, input_file, caption="🎬 Сохранена GIF-анимация")
+                            elif media_type == "video_note":
+                                input_file = types.BufferedInputFile(file_bytes, filename="video_note.mp4")
+                                await bot.send_video_note(owner_id, input_file)
+                                await bot.send_message(owner_id, "⭕️ Сохранен кружок")
                         except Exception as send_err:
                             logger.warning(f"Could not send TTL/Spoiler media back to owner: {send_err}")
             except Exception as e:
@@ -760,11 +820,9 @@ async def on_edited_business_message(msg: types.Message):
     if not owner_id:
         return
         
-    # ДОБАВЛЕНА ПРОВЕРКА
     if not is_user_active(owner_id):
         return
         
-    # Извлекаем данные отправителя для уведомления
     row = fetch_one(supabase.table("messages").select("id,text,sender_id,sender_name,sender_username").eq("connection_id", msg.business_connection_id).eq("chat_id", msg.chat.id).eq("message_id", msg.message_id))
     if not row:
         return
@@ -773,16 +831,13 @@ async def on_edited_business_message(msg: types.Message):
     if old_text == new_text:
         return
         
-    # Сохраняем в историю версий
     supabase.table("message_versions").insert({
         "message_id": row["id"], "old_text": old_text,
         "new_text": new_text, "edited_at": now_utc().isoformat(),
     }).execute()
     
-    # Обновляем основной текст
     supabase.table("messages").update({"text": new_text}).eq("id", row["id"]).execute()
     
-    # Отправляем уведомление, только если это сообщение собеседника
     sender_id = row.get("sender_id")
     if sender_id != owner_id:
         sender_name = row.get("sender_name") or "Неизвестно"
@@ -810,7 +865,6 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
     if not owner_id:
         return
         
-    # ДОБАВЛЕНА ПРОВЕРКА
     if not is_user_active(owner_id):
         return
         
@@ -823,7 +877,6 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
         
         if row:
             m = row
-            # ПОЛНОСТЬЮ ИГНОРИРУЕМ УДАЛЕНИЕ СВОИХ СООБЩЕНИЙ
             if m.get("sender_id") == owner_id:
                 continue
                 
@@ -852,7 +905,6 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
                         "path": mf_row["storage_path"]
                     })
                     
-    # Если валидных сообщений нет (удалены только свои), ничего не сохраняем и не шлем
     if not valid_message_ids:
         return
         
@@ -881,13 +933,18 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
             for media in media_to_send:
                 try:
                     res = supabase.storage.from_(STORAGE_BUCKET).download(media["path"])
-                    input_file = types.BufferedInputFile(res, filename=f"deleted_{media['type']}.jpg")
+                    ext = "jpg" if media["type"] == "photo" else "mp4"
+                    input_file = types.BufferedInputFile(res, filename=f"deleted_{media['type']}.{ext}")
+                    
                     if media["type"] == "photo":
                         await bot.send_photo(owner_id, input_file, caption="📸 Прикрепленное фото из удаленного сообщения")
                     elif media["type"] == "video":
                         await bot.send_video(owner_id, input_file, caption="🎬 Прикрепленное видео из удаленного сообщения")
                     elif media["type"] == "animation":
                         await bot.send_animation(owner_id, input_file, caption="🎬 Прикрепленная GIF из удаленного сообщения")
+                    elif media["type"] == "video_note":
+                        await bot.send_video_note(owner_id, input_file)
+                        await bot.send_message(owner_id, "⭕️ Прикреплен кружок из удаленного сообщения")
                 except Exception as e:
                     logger.warning(f"Could not send deleted media: {e}")
                     
@@ -898,7 +955,6 @@ async def on_deleted_business_messages(event: types.BusinessMessagesDeleted):
 
 app = FastAPI(title="История API")
 
-# ДОБАВЛЕНО: Запуск фоновой задачи при старте сервера
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(check_expirations())
@@ -937,20 +993,17 @@ async def api_stats(user: dict = Depends(get_verified_user)):
 async def api_contacts(q: str = Query(""), user: dict = Depends(get_verified_user)):
     uid = user["id"]
     
-    # Получаем все сообщения пользователя для маппинга ID сообщений в ID чатов
     user_msgs = supabase.table("messages").select("id, chat_id").eq("owner_id", uid).execute()
     user_msg_ids = [m["id"] for m in user_msgs.data] if user_msgs.data else []
     msg_to_chat = {m["id"]: m["chat_id"] for m in user_msgs.data} if user_msgs.data else {}
     
     active_chat_ids = set()
     
-    # 1. Чаты с удаленными сообщениями
     dels = supabase.table("deletion_events").select("chat_id").eq("owner_id", uid).execute()
     if dels.data:
         for d in dels.data:
             active_chat_ids.add(d["chat_id"])
             
-    # 2. Чаты с сохраненными медиафайлами
     media = supabase.table("media_files").select("message_id").eq("owner_id", uid).execute()
     if media.data:
         for m in media.data:
@@ -958,7 +1011,6 @@ async def api_contacts(q: str = Query(""), user: dict = Depends(get_verified_use
             if chat_id:
                 active_chat_ids.add(chat_id)
                 
-    # 3. Чаты с измененными сообщениями
     if user_msg_ids:
         vers_res = supabase.table("message_versions").select("message_id").in_("message_id", user_msg_ids).execute()
         if vers_res.data:
@@ -1008,7 +1060,6 @@ async def api_chat_messages(chat_id: int, user: dict = Depends(get_verified_user
     
     filtered_msgs = []
     for m in all_msgs:
-        # Игнорируем свои сообщения в истории
         if m.get("sender_id") == uid:
             continue
             
