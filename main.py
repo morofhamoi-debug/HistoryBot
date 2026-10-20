@@ -56,6 +56,8 @@ class AdminState(StatesGroup):
     waiting_for_user_msg = State()
     waiting_for_block_id = State()
     waiting_for_unblock_id = State()
+    waiting_for_ref_ban_id = State()
+    waiting_for_ref_unban_id = State()
 
 # ── Утилиты ──────────────────────────────────────────────────────────────────
 
@@ -190,6 +192,253 @@ def is_user_active(user_id: int) -> bool:
             pass
     return True
 
+# ── ДОБАВЛЕНО: Реферальная программа ────────────────────────────────────────
+
+def extend_validity(user_id: int, days: int) -> Optional[str]:
+    """Продлевает valid_until на days. Возвращает новую дату (ISO) или None,
+    если продлевать некуда (юзер не найден или у него бессрочный доступ)."""
+    u = fetch_one(supabase.table("users").select("valid_until").eq("id", user_id))
+    if not u:
+        return None
+    if not u.get("valid_until"):
+        return None
+    now = now_utc()
+    try:
+        curr = datetime.fromisoformat(u["valid_until"].replace("Z", "+00:00"))
+    except ValueError:
+        curr = now
+    base = curr if curr > now else now
+    new_valid = (base + timedelta(days=days)).isoformat()
+    supabase.table("users").update({
+        "valid_until": new_valid,
+        "expiry_notified": False,
+        "expiry_warning_notified": False,
+    }).eq("id", user_id).execute()
+    return new_valid
+
+
+def try_register_referral(tg_user: types.User, referrer_id: int) -> tuple[bool, Optional[dict]]:
+    """Антифрод + запись referrals. Юзер должен уже существовать в users."""
+    if tg_user.id == referrer_id:
+        return False, None
+    ref = fetch_one(supabase.table("users").select("*").eq("id", referrer_id))
+    if not ref or ref.get("status") != "approved" or ref.get("referral_banned"):
+        return False, None
+    existing = fetch_one(supabase.table("users").select("referred_by").eq("id", tg_user.id))
+    if existing and existing.get("referred_by"):
+        return False, None
+    if ref.get("referred_by") == tg_user.id:
+        return False, None
+
+    supabase.table("users").update({"referred_by": referrer_id}).eq("id", tg_user.id).execute()
+    try:
+        supabase.table("referrals").insert({
+            "referrer_id": referrer_id,
+            "referred_id": tg_user.id,
+            "status": "pending",
+        }).execute()
+    except Exception as e:
+        logger.warning(f"referral insert failed: {e}")
+        return False, None
+    return True, ref
+
+
+async def notify_admin_anomaly_if_needed(referrer_id: int):
+    """Пинг админу при >10 приглашений за 24 часа. Без автобана."""
+    try:
+        day_ago = (now_utc() - timedelta(hours=24)).isoformat()
+        count = supabase.table("referrals").select("id", count="exact").eq("referrer_id", referrer_id).gte("created_at", day_ago).execute().count or 0
+        if count >= 11:
+            referrer = fetch_one(supabase.table("users").select("first_name, username").eq("id", referrer_id))
+            label = f"@{referrer['username']}" if referrer and referrer.get("username") else (referrer.get("first_name", str(referrer_id)) if referrer else str(referrer_id))
+            try:
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ <b>Аномалия в рефералке</b>\n\n"
+                    f"👤 {label} (id: <code>{referrer_id}</code>) пригласил {count} человек за 24 часа.\n"
+                    f"Проверь на накрутку.",
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning(f"notify_admin_anomaly_if_needed failed: {e}")
+
+
+async def process_referral_reward(user_id: int):
+    """Начисление награды приглашённому и рефереру. Вызывается при одобрении."""
+    ref = fetch_one(supabase.table("referrals").select("*").eq("referred_id", user_id).eq("status", "pending"))
+    if not ref:
+        return
+
+    referrer_id = ref["referrer_id"]
+    reward_days = ref.get("reward_days") or 3
+    referred_bonus = ref.get("referred_bonus_days") or 3
+
+    referrer = fetch_one(supabase.table("users").select("first_name, valid_until, referral_banned").eq("id", referrer_id))
+
+    target_status = "rewarded"
+    cancel_reason = None
+
+    if not referrer or referrer.get("referral_banned"):
+        target_status = "cancelled"
+        cancel_reason = "banned_referrer"
+    elif not referrer.get("valid_until"):
+        target_status = "cancelled"
+        cancel_reason = "lifetime_referrer"
+    else:
+        rewarded_count = supabase.table("referrals").select("id", count="exact").eq("referrer_id", referrer_id).eq("status", "rewarded").execute().count or 0
+        if rewarded_count >= 20:
+            target_status = "cancelled"
+            cancel_reason = "limit"
+
+    # Атомарно "занимаем" запись — защита от гонки
+    update_data = {"status": target_status}
+    if target_status == "rewarded":
+        update_data["rewarded_at"] = now_utc().isoformat()
+    else:
+        update_data["cancel_reason"] = cancel_reason
+
+    claim = supabase.table("referrals").update(update_data).eq("id", ref["id"]).eq("status", "pending").execute()
+    if not claim.data:
+        return  # уже обработана параллельно
+
+    # Приглашённый получает бонус во всех случаях (если у него срочный доступ)
+    new_valid_refd = extend_validity(user_id, referred_bonus)
+
+    # Реферер получает награду только если статус rewarded
+    new_valid_ref = None
+    if target_status == "rewarded":
+        new_valid_ref = extend_validity(referrer_id, reward_days)
+
+    referred = fetch_one(supabase.table("users").select("first_name, username").eq("id", user_id))
+    referred_label = f"@{referred['username']}" if referred and referred.get("username") else (referred.get("first_name", "пользователь") if referred else "пользователь")
+
+    if target_status == "rewarded":
+        try:
+            await bot.send_message(
+                referrer_id,
+                f"💎 <b>+{reward_days} дня!</b>\n\n{referred_label} получил доступ по вашей ссылке.\n"
+                f"Ваш доступ продлён до <b>{fmt_dt(new_valid_ref)}</b>.",
+            )
+        except Exception as e:
+            logger.warning(f"referrer notify failed: {e}")
+    elif cancel_reason == "limit":
+        try:
+            await bot.send_message(
+                referrer_id,
+                f"⚠️ По вашей ссылке пришёл {referred_label}, но лимит рефералов (20) достигнут. Награда не начислена.",
+            )
+        except Exception:
+            pass
+    elif cancel_reason == "lifetime_referrer":
+        try:
+            await bot.send_message(
+                referrer_id,
+                f"ℹ️ По вашей ссылке пришёл {referred_label}, но у вас бессрочный доступ — начислять некуда.",
+            )
+        except Exception:
+            pass
+
+    if new_valid_refd is not None:
+        try:
+            await bot.send_message(
+                user_id,
+                f"💎 <b>+{referred_bonus} дня бонусом!</b>\n\nВы зарегистрировались по реферальной ссылке.\n"
+                f"Ваш доступ продлён до <b>{fmt_dt(new_valid_refd)}</b>.",
+            )
+        except Exception as e:
+            logger.warning(f"referred notify failed: {e}")
+
+
+async def render_referral(user_id: int):
+    u = fetch_one(supabase.table("users").select("status, referral_banned").eq("id", user_id))
+    if not u or u.get("status") != "approved":
+        return "❌ Реферальная программа доступна только после одобрения доступа.", None
+    if u.get("referral_banned"):
+        return "🚫 Доступ к реферальной программе заблокирован администратором.", None
+
+    all_refs = supabase.table("referrals").select("status").eq("referrer_id", user_id).execute().data or []
+    pending = sum(1 for r in all_refs if r["status"] == "pending")
+    rewarded = sum(1 for r in all_refs if r["status"] == "rewarded")
+    cancelled = sum(1 for r in all_refs if r["status"] == "cancelled")
+    days_earned = rewarded * 3
+
+    try:
+        bot_info = await bot.get_me()
+        bot_username = bot_info.username
+    except Exception:
+        bot_username = "KhamoiHistory_Bot"
+
+    link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+    share_text = "Залетай в «Глазок» — бот сохраняет удалённые сообщения!"
+
+    text = (
+        "🎁 <b>Реферальная программа</b>\n\n"
+        "Приглашайте друзей и получайте <b>+3 дня</b> доступа к «Глазку» за каждого, кому одобрят доступ!\n"
+        "<i>Ваш друг тоже получит +3 дня бонусом.</i>\n\n"
+        f"🔗 Ваша ссылка:\n<code>{link}</code>\n\n"
+        f"📊 Приглашено: <b>{pending + rewarded + cancelled}</b>\n"
+        f"✅ Начислено: <b>{rewarded}</b> (+{days_earned} дней)\n"
+        + (f"⏳ Ожидают одобрения: <b>{pending}</b>\n" if pending else "")
+        + (f"⚠️ Не зачтено: <b>{cancelled}</b>\n" if cancelled else "")
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Поделиться", switch_inline_query=share_text)],
+        [InlineKeyboardButton(text="📋 Мои приглашения", callback_data="my_referrals_list")],
+    ])
+    return text, kb
+
+
+@dp.message(Command("ref", "referral"))
+async def cmd_ref(message: types.Message):
+    text, kb = await render_referral(message.from_user.id)
+    if kb:
+        await message.answer(text, reply_markup=kb)
+    else:
+        await message.answer(text)
+
+
+@dp.callback_query(F.data == "show_referral")
+async def cb_show_referral(cq: CallbackQuery):
+    await safe_answer(cq)
+    text, kb = await render_referral(cq.from_user.id)
+    if kb:
+        try:
+            await cq.message.answer(text, reply_markup=kb)
+        except Exception:
+            pass
+    else:
+        await safe_answer(cq, text, show_alert=True)
+
+
+@dp.callback_query(F.data == "my_referrals_list")
+async def cb_my_referrals_list(cq: CallbackQuery):
+    await safe_answer(cq)
+    res = supabase.table("referrals").select("referred_id, status, created_at").eq("referrer_id", cq.from_user.id).order("created_at", desc=True).limit(20).execute()
+    refs = res.data or []
+
+    if not refs:
+        await cq.message.answer("У вас пока нет приглашений.")
+        return
+
+    status_map = {"pending": "⏳ ожидает", "rewarded": "✅ зачтено", "cancelled": "❌ не зачтено"}
+    lines = ["📋 <b>Ваши последние приглашения</b>\n"]
+    for r in refs:
+        uid = r["referred_id"]
+        ref_user = fetch_one(supabase.table("users").select("first_name, username").eq("id", uid))
+        if ref_user:
+            name = f"@{ref_user['username']}" if ref_user.get("username") else (ref_user.get("first_name") or str(uid))
+        else:
+            name = str(uid)
+        lines.append(f"• {name} — {status_map.get(r['status'], r['status'])} ({fmt_dt(r.get('created_at'))})")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="show_referral")],
+    ])
+    await cq.message.answer("\n".join(lines), reply_markup=kb)
+
+# ── КОНЕЦ ДОБАВЛЕННОГО: Реферальная программа ───────────────────────────────
+
 # ── ДОБАВЛЕНО ИЗМЕНЕНИЕ: Фоновая задача (добавлено предупреждение за 3 дня) ──
 async def check_expirations():
     while True:
@@ -264,7 +513,8 @@ async def get_instruction_msg():
             InlineKeyboardButton(text="Скопировать @", copy_text=types.CopyTextButton(text=f"@{bot_username}")),
             InlineKeyboardButton(text="🔌 Подключить Глазок", url="tg://settings/edit")
         ],
-        [InlineKeyboardButton(text="? Инструкция", callback_data="show_instructions_info")]
+        [InlineKeyboardButton(text="? Инструкция", callback_data="show_instructions_info")],
+        [InlineKeyboardButton(text="🎁 Реферальная программа", callback_data="show_referral")]
     ])
     return text, kb
 
@@ -277,6 +527,7 @@ def get_admin_kb():
          InlineKeyboardButton(text="💼 Подключения", callback_data="admin_conns")],
         [InlineKeyboardButton(text="✉️ Написать юзеру", callback_data="admin_msg_user")],
         [InlineKeyboardButton(text="📢 Написать всем (Рассылка)", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="🎁 Рефералы", callback_data="admin_refs")],
         [InlineKeyboardButton(text="🔒 Заблокировать", callback_data="admin_block"), 
          InlineKeyboardButton(text="🔓 Разблокировать", callback_data="admin_unblock")]
     ])
@@ -380,6 +631,136 @@ async def process_unblock(message: types.Message, state: FSMContext):
     try: await bot.send_message(uid, "✅ <b>Ваш доступ восстановлен!</b>\nДобро пожаловать обратно в «Глазок».")
     except Exception: pass
     await message.answer(f"✅ Пользователь <code>{uid}</code> разблокирован.", reply_markup=get_admin_kb())
+
+# ── ДОБАВЛЕНО: Админ-секция рефералов ───────────────────────────────────────
+
+@dp.callback_query(F.data == "admin_refs")
+async def cb_admin_refs(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+
+    all_refs = supabase.table("referrals").select("status, cancel_reason").execute().data or []
+    total = len(all_refs)
+    rewarded = sum(1 for r in all_refs if r["status"] == "rewarded")
+    pending = sum(1 for r in all_refs if r["status"] == "pending")
+    cancelled = sum(1 for r in all_refs if r["status"] == "cancelled")
+    cancelled_limit = sum(1 for r in all_refs if r["status"] == "cancelled" and r.get("cancel_reason") == "limit")
+    cancelled_banned = sum(1 for r in all_refs if r["status"] == "cancelled" and r.get("cancel_reason") == "banned_referrer")
+    cancelled_lifetime = sum(1 for r in all_refs if r["status"] == "cancelled" and r.get("cancel_reason") == "lifetime_referrer")
+    conversion = int((rewarded / total * 100)) if total else 0
+
+    top_res = supabase.table("referrals").select("referrer_id").eq("status", "rewarded").execute()
+    top_counts = {}
+    for r in (top_res.data or []):
+        top_counts[r["referrer_id"]] = top_counts.get(r["referrer_id"], 0) + 1
+    top_sorted = sorted(top_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+
+    top_lines = []
+    for rid, cnt in top_sorted:
+        u = fetch_one(supabase.table("users").select("first_name, username").eq("id", rid))
+        label = f"@{u['username']}" if u and u.get("username") else (u.get("first_name") if u else str(rid))
+        top_lines.append(f"• {label} (id: <code>{rid}</code>) — {cnt}")
+
+    cancelled_detail = ""
+    if cancelled:
+        parts = []
+        if cancelled_limit: parts.append(f"лимит: {cancelled_limit}")
+        if cancelled_banned: parts.append(f"бан: {cancelled_banned}")
+        if cancelled_lifetime: parts.append(f"бессрочник: {cancelled_lifetime}")
+        if parts:
+            cancelled_detail = f" ({', '.join(parts)})"
+
+    text = (
+        f"🎁 <b>Реферальная программа</b>\n\n"
+        f"📊 Всего приглашений: <b>{total}</b>\n"
+        f"✅ Начислено: <b>{rewarded}</b> (+{rewarded * 3} дней)\n"
+        f"⏳ Ожидают: <b>{pending}</b>\n"
+        f"❌ Отменено: <b>{cancelled}</b>{cancelled_detail}\n"
+        f"📈 Конверсия: <b>{conversion}%</b>\n"
+    )
+    if top_lines:
+        text += "\n🏆 <b>Топ-5 рефереров:</b>\n" + "\n".join(top_lines)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Последние 20", callback_data="admin_refs_list")],
+        [InlineKeyboardButton(text="🚫 Забанить реферера", callback_data="admin_ref_ban"),
+         InlineKeyboardButton(text="🔓 Разбанить", callback_data="admin_ref_unban")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]
+    ])
+    await cq.message.edit_text(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data == "admin_refs_list")
+async def cb_admin_refs_list(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+
+    res = supabase.table("referrals").select("*").order("created_at", desc=True).limit(20).execute()
+    refs = res.data or []
+
+    if not refs:
+        text = "Приглашений нет."
+    else:
+        status_emoji = {"pending": "⏳", "rewarded": "✅", "cancelled": "❌"}
+        lines = ["📋 <b>Последние 20 приглашений</b>\n"]
+        for r in refs:
+            emoji = status_emoji.get(r["status"], "•")
+            reason = f" ({r['cancel_reason']})" if r.get("cancel_reason") else ""
+            lines.append(f"{emoji} <code>{r['referrer_id']}</code> → <code>{r['referred_id']}</code>{reason} · {fmt_dt(r.get('created_at'))}")
+        text = "\n".join(lines)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_refs")]
+    ])
+    await cq.message.edit_text(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data == "admin_ref_ban")
+async def cb_admin_ref_ban(cq: CallbackQuery, state: FSMContext):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    await state.set_state(AdminState.waiting_for_ref_ban_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_refs")]])
+    await cq.message.edit_text("🚫 Отправьте ID пользователя, которому нужно <b>заблокировать реферальную программу</b>:", reply_markup=kb)
+
+
+@dp.message(AdminState.waiting_for_ref_ban_id)
+async def process_ref_ban(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    if not message.text.isdigit():
+        await message.answer("⚠️ ID должен состоять только из цифр. Попробуйте снова.")
+        return
+    uid = int(message.text)
+    await state.clear()
+    supabase.table("users").update({"referral_banned": True}).eq("id", uid).execute()
+    try: await bot.send_message(uid, "🚫 Доступ к реферальной программе заблокирован администратором.")
+    except Exception: pass
+    await message.answer(f"✅ Пользователь <code>{uid}</code> заблокирован в реф-программе.", reply_markup=get_admin_kb())
+
+
+@dp.callback_query(F.data == "admin_ref_unban")
+async def cb_admin_ref_unban(cq: CallbackQuery, state: FSMContext):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    await state.set_state(AdminState.waiting_for_ref_unban_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_refs")]])
+    await cq.message.edit_text("🔓 Отправьте ID пользователя, которому нужно <b>разблокировать реферальную программу</b>:", reply_markup=kb)
+
+
+@dp.message(AdminState.waiting_for_ref_unban_id)
+async def process_ref_unban(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    if not message.text.isdigit():
+        await message.answer("⚠️ ID должен состоять только из цифр. Попробуйте снова.")
+        return
+    uid = int(message.text)
+    await state.clear()
+    supabase.table("users").update({"referral_banned": False}).eq("id", uid).execute()
+    try: await bot.send_message(uid, "🔓 Доступ к реферальной программе восстановлен администратором.")
+    except Exception: pass
+    await message.answer(f"✅ Пользователь <code>{uid}</code> разблокирован в реф-программе.", reply_markup=get_admin_kb())
+
+# ── КОНЕЦ ДОБАВЛЕННОГО: Админ-секция рефералов ──────────────────────────────
 
 # ── ЛИЧНЫЕ СООБЩЕНИЯ ────────────────────────────────────────────────────────
 
@@ -678,6 +1059,18 @@ async def cb_term_set(cq: CallbackQuery):
                 await bot.send_message(req["user_id"], user_text, reply_markup=user_kb)
             except Exception as e: logger.warning(f"Could not send term notify to {req['user_id']}: {e}")
 
+    # ДОБАВЛЕНО: начисление реферальной награды (только при одобрении/выдаче срока)
+    if target_type == "user":
+        _actual_uid = target_id
+    else:
+        _req = fetch_one(supabase.table("access_requests").select("user_id").eq("id", target_id))
+        _actual_uid = _req["user_id"] if _req else None
+    if _actual_uid:
+        try:
+            await process_referral_reward(_actual_uid)
+        except Exception as e:
+            logger.warning(f"process_referral_reward failed: {e}")
+
     await cq.message.edit_text("✅ Срок успешно установлен.")
     await asyncio.sleep(1.5)
     if target_type == "user":
@@ -737,21 +1130,25 @@ async def process_custom_date(message: types.Message, state: FSMContext):
             
         await message.answer(f"✅ Пользователь одобрен, срок до: {fmt_dt(valid_until)}")
 
+    # ДОБАВЛЕНО: начисление реферальной награды (только при одобрении/выдаче срока)
+    if target_type == "user":
+        _actual_uid = target_id
+    else:
+        _req = fetch_one(supabase.table("access_requests").select("user_id").eq("id", target_id))
+        _actual_uid = _req["user_id"] if _req else None
+    if _actual_uid:
+        try:
+            await process_referral_reward(_actual_uid)
+        except Exception as e:
+            logger.warning(f"process_referral_reward failed: {e}")
+
 # ── Стандартные команды ──────────────────────────────────────────────────────
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Начать пользоваться", callback_data="start_usage")]
     ])
-    
-    if message.from_user.id == ADMIN_ID:
-        admin_kb = types.ReplyKeyboardMarkup(
-            keyboard=[[types.KeyboardButton(text="👥 Пользователи")]],
-            resize_keyboard=True,
-            is_persistent=True
-        )
-        await message.answer("🛠 <b>Режим администратора активирован.</b>", reply_markup=admin_kb)
 
     caption = (
         "👋 Добро пожаловать в «Глазок»!\n"
@@ -759,7 +1156,26 @@ async def cmd_start(message: types.Message):
         "и отслеживания удалений.\n👨‍💻 Создатель: Khamoi\n\n"
         "Для начала нажмите кнопку ниже."
     )
-    
+
+    # ДОБАВЛЕНО: парсинг реф-диплинка + баннер
+    banner = None
+    if message.text and len(message.text.split()) > 1:
+        payload = message.text.split(maxsplit=1)[1]
+        if payload.startswith("ref_"):
+            try:
+                referrer_id = int(payload[4:])
+                if referrer_id != message.from_user.id:
+                    ref = fetch_one(supabase.table("users").select("first_name, status, referral_banned").eq("id", referrer_id))
+                    if ref and ref.get("status") == "approved" and not ref.get("referral_banned"):
+                        await state.update_data(ref_pending=referrer_id)
+                        referrer_name = ref.get("first_name") or "пользователь"
+                        banner = f"🎁 Вас пригласил {referrer_name}. После одобрения вы получите +3 дня."
+            except ValueError:
+                pass
+
+    if banner:
+        caption = f"{banner}\n\n{caption}"
+
     try:
         await message.answer_photo(photo=STARTI_IMG_URL, caption=caption, reply_markup=kb)
     except Exception as e:
@@ -787,14 +1203,26 @@ async def handle_admin_users_btn(message: types.Message):
         await message.answer(f"⚠️ <b>Ошибка при загрузке списка:</b>\n<code>{str(e)}</code>")
 
 @dp.callback_query(F.data == "start_usage")
-async def cb_start_usage(cq: CallbackQuery):
+async def cb_start_usage(cq: CallbackQuery, state: FSMContext):
     await safe_answer(cq)
     try:
         user = ensure_user(cq.from_user)
     except Exception as e:
         await cq.message.answer(f"⚠️ <b>Ошибка базы данных Supabase:</b>\n<code>{str(e)}</code>")
         return
-        
+
+    # ДОБАВЛЕНО: обработка реф-диплинка (отложенно, после ensure_user)
+    fsm_data = await state.get_data()
+    ref_pending = fsm_data.get("ref_pending")
+    if ref_pending:
+        try:
+            ok, _ = try_register_referral(cq.from_user, ref_pending)
+            if ok:
+                await notify_admin_anomaly_if_needed(ref_pending)
+        except Exception as e:
+            logger.warning(f"referral processing failed: {e}")
+        await state.update_data(ref_pending=None)
+
     if user["status"] == "approved":
         if user.get("valid_until"):
             try:
