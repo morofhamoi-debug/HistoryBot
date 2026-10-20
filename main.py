@@ -1138,9 +1138,9 @@ async def cmd_myid(message: types.Message):
 @dp.message(Command("support"))
 async def cmd_support(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Нап awaitисать @Gasp messageardShop", url="https://t.me/GaspardShop.")]
+        [InlineKeyboardButton(text="💬 Написать @GaspardShop", url="https://t.me/GaspardShop")]
     ])
-   answer(
+    await message.answer(
         "💬 <b>Служба поддержки</b>\n\n"
         "По всем вопросам (продление доступа, ошибки, предложения) "
         "обращайтесь к администратору по кнопке ниже:",
