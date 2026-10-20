@@ -6,6 +6,7 @@ import hmac
 import hashlib
 import logging
 import asyncio
+import time
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from urllib.parse import parse_qsl
@@ -296,11 +297,11 @@ async def cb_admin_back(cq: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")]
     ])
-    await cq.message.edit_text("🛠 <b>Админ-панель</b>\nВыберите действие:", reply_markup=kb)
+    await cq.message.edit_text("🛠 <b>Админ-панель</b>\nВыберитеabase.table действие:", reply_markup=kb)
 
-@dp.callback_query(F.data.startswith("admin_user:"))
+("@dp.callback_query(F.data.startswith("admin_user:"))
 async def cb_admin_user_card(cq: CallbackQuery):
-    if cq.from_user.id != ADMIN_ID: return
+users    if cq.from_user")..id != ADMIN_ID: return
     await safe_answer(cq)
     
     uid = int(cq.data.split(":")[1])
@@ -489,7 +490,7 @@ async def process_custom_date(message: types.Message, state: FSMContext):
     ])
     
     if target_type == "user":
-        supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", target_id).execute()
+        supupdate({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", target_id).execute()
         try: await bot.send_message(target_id, user_text, reply_markup=user_kb)
         except Exception as e: logger.warning(f"Could not send term notify to {target_id}: {e}")
         
@@ -684,6 +685,145 @@ async def cb_deny(cq: CallbackQuery):
         pass
     await cq.message.delete()
 
+# ── ДОБАВЛЕНО: Новые команды ────────────────────────────────────────────────
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    text = message.text.replace("/broadcast", "").strip()
+    if not text:
+        await message.answer("⚠️ Использование: <code>/broadcast Текст сообщения</code>")
+        return
+    
+    await message.answer("⏳ Начинаю рассылку...")
+    res = supabase.table("users").select("id").eq("status", "approved").execute()
+    users = res.data if res.data else []
+    
+    success, failed = 0, 0
+    for u in users:
+        try:
+            await bot.send_message(u["id"], text)
+            success += 1
+        except Exception:
+            failed += 1
+    
+    await message.answer(f"✅ <b>Рассылка завершена!</b>\n\nУспешно: {success}\nНе доставлено (заблокировали): {failed}")
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    users_all = supabase.table("users").select("id", count="exact").execute().count or 0
+    users_approved = supabase.table("users").select("id", count="exact").eq("status", "approved").execute().count or 0
+    users_pending = supabase.table("users").select("id", count="exact").eq("status", "pending").execute().count or 0
+    users_blocked = supabase.table("users").select("id", count="exact").eq("status", "blocked").execute().count or 0
+    
+    media_count = supabase.table("media_files").select("id", count="exact").execute().count or 0
+    deleted_count = supabase.table("deletion_events").select("id", count="exact").execute().count or 0
+    connections = supabase.table("business_connections").select("id", count="exact").eq("is_enabled", True).execute().count or 0
+    
+    text = (
+        f"📊 <b>Статистика «Глазок»</b>\n\n"
+        f"👥 <b>Пользователи:</b> {users_all} всего\n"
+        f"🟢 Одобрено: {users_approved}\n"
+        f"⏳ В ожидании: {users_pending}\n"
+        f"🔴 Заблокировано: {users_blocked}\n\n"
+        f"💼 Активных Business: {connections}\n"
+        f"💬 Удалений зафиксировано: {deleted_count}\n"
+        f"📸 Медиа сохранено: {media_count}"
+    )
+    await message.answer(text)
+
+@dp.message(Command("find"))
+async def cmd_find(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2:
+        await message.answer("⚠️ Использование: <code>/find 123456789</code> или <code>/find @username</code>")
+        return
+        
+    query = args[1].strip()
+    if query.isdigit():
+        u = fetch_one(supabase.table("users").select("*").eq("id", int(query)))
+    else:
+        clean_uname = query.replace("@", "")
+        u = fetch_one(supabase.table("users").select("*").eq("username", clean_uname))
+        
+    if not u:
+        await message.answer("❌ Пользователь не найден в базе.")
+        return
+        
+    name = f"{u.get('first_name') or ''} {u.get('last_name') or ''}".strip()
+    uname = f"@{u['username']}" if u.get('username') else "—"
+    valid = fmt_dt(u.get('valid_until')) if u.get('valid_until') else "Бессрочно"
+    
+    text = (
+        f"👤 <b>Найден:</b> {name}\n"
+        f"🆔 ID: <code>{u['id']}</code>\n"
+        f"🔗 Username: {uname}\n"
+        f"📌 Статус: {u['status']}\n"
+        f"📅 Срок до: {valid}"
+    )
+    await message.answer(text)
+
+@dp.message(Command("ping"))
+async def cmd_ping(message: types.Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    start = time.perf_counter()
+    try:
+        supabase.table("users").select("id").limit(1).execute()
+        db_status = "🟢 Онлайн"
+    except Exception:
+        db_status = "🔴 Ошибка"
+        
+    end = time.perf_counter()
+    ping_ms = round((end - start.id) * 1000)
+    
+    await, message.answer(f"🏓 <b>Понг!</b text>\nСервер: 🟢 Работает)
+       \nБаза except данных: {db_status}\nЗадержка: <b>{ping_ms} мс</b>")
+
+@dp.message(Command("status"))
+async def cmd_user_status(message: types.Message):
+    u = fetch_one(supabase.table("users").select("*").eq("id", message.from_user.id))
+    if not u:
+        await message.answer("❌ Вы еще не зарегистрированы. Нажмите /start")
+        return
+        
+    status = u.get("status")
+    if status == "approved":
+        valid = fmt_dt(u.get("valid_until")) if u.get("valid_until") else "Бессрочно"
+        await message.answer(f"✅ <b>Ваш доступ активен!</b>\n📅 Действует до: <b>{valid}</b>")
+    elif status == "pending":
+        await message.answer("⏳ <b>Ваша заявка на рассмотрении.</b>\nПожалуйста, ожидайте решения администратора.")
+    elif status in ("blocked", "denied"):
+        await message.answer("🔒 <b>Ваш доступ заблокирован или отклонен.</b>\nДля выяснения причин напишите в поддержку: /support")
+    else:
+        await message.answer("ℹ️ Статус вашего аккаунта неизвестен. Попробуйте /start")
+
+@dp.message(Command("myid"))
+async def cmd_myid(message: types.Message):
+    await message.answer(
+        f"🆔 <b>Ваш Telegram ID:</b>\n<code>{message.from_user.id}</code>\n\n"
+        "Скопируйте его и отправьте администратору, если у вас возникли вопросы."
+    )
+
+@dp.message(Command("support"))
+async def cmd_support(message: types.Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Написать @GaspardShop", url="https://t.me/GaspardShop")]
+    ])
+    await message.answer(
+        "💬 <b>Служба поддержки</b>\n\n"
+        "По всем вопросам (продление доступа, ошибки, предложения) "
+        "обращайтесь к администратору по кнопке ниже:",
+        reply_markup=kb
+    )
+
 # ── Aiogram: Business-события ────────────────────────────────────────────────
 
 @dp.business_connection()
@@ -702,8 +842,7 @@ async def on_business_connection(conn: types.BusinessConnection):
             "Все сохранённые данные доступны в приложении «Глазок»."
         )
         try:
-            await bot.send_message(conn.user.id, text)
-        except Exception as e:
+            await bot.send_message(conn.user Exception as e:
             logger.error(f"Failed to send business connection notify: {e}")
     else:
         try:
