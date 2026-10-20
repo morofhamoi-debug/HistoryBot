@@ -344,13 +344,14 @@ async def get_instruction_msg():
             InlineKeyboardButton(text="Скопировать @", copy_text=types.CopyTextButton(text=f"@{bot_username}")),
             InlineKeyboardButton(text="🔌 Подключить Глазок", url="tg://settings/edit")
         ],
-        [InlineKeyboardButton(text="? Инструкция", callback_data="show_instructions_info")]
+        [InlineKeyboardButton(text="? Инструкция", callback_data="show_instructions_info")],
+        [InlineKeyboardButton(text="🎁 Реферальная программа", callback_data="show_referral")]
     ])
     return text, kb
 
-# ── ДОБАВЛЕНО: Обработчик кнопки реферальной программы ──────────────────────
-@dp.message(F.text == "🎁 Реферальная программа")
-async def handle_referral_program(message: types.Message):
+# ── ДОБАВЛЕНО: Реферальная программа (общий хелпер + все триггеры) ──────────
+
+async def send_referral(message: types.Message):
     user_id = message.from_user.id
 
     try:
@@ -385,6 +386,18 @@ async def handle_referral_program(message: types.Message):
     ])
 
     await message.answer(text, reply_markup=kb)
+
+
+@dp.message(Command("ref"))
+@dp.message(F.text == "🎁 Реферальная программа")
+async def handle_referral_program(message: types.Message):
+    await send_referral(message)
+
+
+@dp.callback_query(F.data == "show_referral")
+async def cb_show_referral(cq: CallbackQuery):
+    await safe_answer(cq)
+    await send_referral(cq.message)
 # ────────────────────────────────────────────────────────────────────────────
 
 # ── Aiogram: Админ-панель ────────────────────────────────────────────────────
@@ -897,18 +910,11 @@ async def cmd_start(message: types.Message):
     
     if message.from_user.id == ADMIN_ID:
         admin_kb = types.ReplyKeyboardMarkup(
-            keyboard=[[types.KeyboardButton(text="👥 Пользователи"), types.KeyboardButton(text="🎁 Реферальная программа")]],
+            keyboard=[[types.KeyboardButton(text="👥 Пользователи")]],
             resize_keyboard=True,
             is_persistent=True
         )
         await message.answer("🛠 <b>Режим администратора активирован.</b>", reply_markup=admin_kb)
-    else:
-        user_kb = types.ReplyKeyboardMarkup(
-            keyboard=[[types.KeyboardButton(text="🎁 Реферальная программа")]],
-            resize_keyboard=True,
-            is_persistent=True
-        )
-        await message.answer("👇 Меню бота:", reply_markup=user_kb)
 
     caption = (
         "👋 Добро пожаловать в «Глазок»!\n"
