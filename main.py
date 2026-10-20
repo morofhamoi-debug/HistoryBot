@@ -7,6 +7,7 @@ import hashlib
 import logging
 import asyncio
 import time
+import uuid
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
 from urllib.parse import parse_qsl
@@ -48,9 +49,13 @@ dp = Dispatcher()
 # Московское время (UTC+3)
 MSK_TZ = timezone(timedelta(hours=3))
 
-# ── Состояния (для ввода даты) ───────────────────────────────────────────────
+# ── Состояния ────────────────────────────────────────────────────────────────
 class AdminState(StatesGroup):
     waiting_for_custom_date = State()
+    waiting_for_broadcast = State()
+    waiting_for_user_msg = State()
+    waiting_for_block_id = State()
+    waiting_for_unblock_id = State()
 
 # ── Утилиты ──────────────────────────────────────────────────────────────────
 
@@ -169,7 +174,6 @@ def get_owner_by_connection(connection_id: str) -> Optional[int]:
     res = fetch_one(supabase.table("business_connections").select("owner_id").eq("id", connection_id))
     return res["owner_id"] if res else None
 
-# ДОБАВЛЕНА ФУНКЦИЯ ПРОВЕРКИ ДОСТУПА
 def is_user_active(user_id: int) -> bool:
     u = fetch_one(supabase.table("users").select("status, valid_until").eq("id", user_id))
     if not u or u.get("status") != "approved":
@@ -186,14 +190,16 @@ def is_user_active(user_id: int) -> bool:
             pass
     return True
 
-# ── ДОБАВЛЕНО: Фоновая задача для проверки сроков ──────────────────────────
+# ── ДОБАВЛЕНО ИЗМЕНЕНИЕ: Фоновая задача (добавлено предупреждение за 3 дня) ──
 async def check_expirations():
     while True:
         try:
-            now_iso = now_utc().isoformat()
-            # Ищем тех, у кого истек срок и еще не отправлено уведомление
+            now = now_utc()
+            now_iso = now.isoformat()
+            warning_date = (now + timedelta(days=3)).isoformat()
+
+            # 1. Проверка тех, у кого срок УЖЕ истек
             res = supabase.table("users").select("id").lt("valid_until", now_iso).or_("expiry_notified.eq.false,expiry_notified.is.null").execute()
-            
             if res.data:
                 for u in res.data:
                     uid = u["id"]
@@ -202,12 +208,24 @@ async def check_expirations():
                         supabase.table("users").update({"expiry_notified": True, "status": "denied"}).eq("id", uid).execute()
                     except Exception as e:
                         logger.warning(f"Could not send expiry message to {uid}: {e}")
-                        # Если заблокировали бота, все равно ставим флаг
                         supabase.table("users").update({"expiry_notified": True, "status": "denied"}).eq("id", uid).execute()
+
+            # 2. Проверка тех, у кого осталось 3 дня или меньше
+            res_warn = supabase.table("users").select("id").gte("valid_until", now_iso).lte("valid_until", warning_date).or_("expiry_warning_notified.eq.false,expiry_warning_notified.is.null").execute()
+            if res_warn.data:
+                for u in res_warn.data:
+                    uid = u["id"]
+                    try:
+                        await bot.send_message(uid, "⚠️ <b>Внимание! Ваш доступ скоро закончится.</b>\n\nДоступ к боту «Глазок» будет приостановлен через 3 дня (или меньше).\nЧтобы не потерять историю, продлите доступ заранее.\n\nСвязаться с администратором: @GaspardShop")
+                        supabase.table("users").update({"expiry_warning_notified": True}).eq("id", uid).execute()
+                    except Exception as e:
+                        logger.warning(f"Could not send warning message to {uid}: {e}")
+                        supabase.table("users").update({"expiry_warning_notified": True}).eq("id", uid).execute()
+
         except Exception as e:
             logger.error(f"Error in check_expirations: {e}")
             
-        await asyncio.sleep(300) # Проверка каждые 5 минут
+        await asyncio.sleep(300)
 # ────────────────────────────────────────────────────────────────────────────
 
 def upsert_chat(connection_id: str, chat: types.Chat, owner_id: int):
@@ -234,7 +252,6 @@ async def get_instruction_msg():
     except Exception:
         bot_username = "KhamoiHistory_Bot"
 
-    # ИЗМЕНЕНО: Удалены строки, которые ты обвел белым на скриншоте
     text = (
         "✅ <b>Доступ открыт. Добро пожаловать в «Глазок»!</b>\n\n"
         "<b>Бот не подключён</b>\n"
@@ -253,14 +270,250 @@ async def get_instruction_msg():
 
 # ── Aiogram: Админ-панель ────────────────────────────────────────────────────
 
+def get_admin_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")],
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="admin_stats"), 
+         InlineKeyboardButton(text="💼 Подключения", callback_data="admin_conns")],
+        [InlineKeyboardButton(text="✉️ Написать юзеру", callback_data="admin_msg_user")],
+        [InlineKeyboardButton(text="📢 Написать всем (Рассылка)", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text="🔒 Заблокировать", callback_data="admin_block"), 
+         InlineKeyboardButton(text="🔓 Разблокировать", callback_data="admin_unblock")]
+    ])
+
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
+    await message.answer("🛠 <b>Админ-панель</b>\nВыберите действие:", reply_markup=get_admin_kb())
+
+# ── НОВЫЕ ОБРАБОТЧИКИ АДМИН-ПАНЕЛИ ──────────────────────────────────────────
+
+@dp.callback_query(F.data == "admin_stats")
+async def cb_admin_stats(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    
+    users_all = supabase.table("users").select("id", count="exact").execute().count or 0
+    users_approved = supabase.table("users").select("id", count="exact").eq("status", "approved").execute().count or 0
+    users_pending = supabase.table("users").select("id", count="exact").eq("status", "pending").execute().count or 0
+    users_blocked = supabase.table("users").select("id", count="exact").eq("status", "blocked").execute().count or 0
+    
+    media_count = supabase.table("media_files").select("id", count="exact").execute().count or 0
+    deleted_count = supabase.table("deletion_events").select("id", count="exact").execute().count or 0
+    connections = supabase.table("business_connections").select("id", count="exact").eq("is_enabled", True).execute().count or 0
+    
+    text = (
+        f"📊 <b>Статистика «Глазок»</b>\n\n"
+        f"👥 <b>Пользователи:</b> {users_all} всего\n"
+        f"🟢 Одобрено: {users_approved}\n"
+        f"⏳ В ожидании: {users_pending}\n"
+        f"🔴 Заблокировано: {users_blocked}\n\n"
+        f"💼 Активных Business: {connections}\n"
+        f"💬 Удалений зафиксировано: {deleted_count}\n"
+        f"📸 Медиа сохранено: {media_count}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]])
+    await cq.message.edit_text(text, reply_markup=kb)
+
+@dp.callback_query(F.data == "admin_conns")
+async def cb_admin_conns(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    
+    res = supabase.table("business_connections").select("owner_id").eq("is_enabled", True).execute()
+    if not res.data:
+        text = "💼 <b>Активные подключения</b>\n\nСейчас нет активных Business-подключений."
+    else:
+        uids = [str(r["owner_id"]) for r in res.data]
+        text = f"💼 <b>Активные подключения ({len(uids)})</b>\n\n" + "\n".join([f"🆔 <code>{uid}</code>" for uid in uids])
+        
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]])
+    await cq.message.edit_text(text, reply_markup=kb)
+
+@dp.callback_query(F.data == "admin_back")
+async def cb_admin_back(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    await cq.message.edit_text("🛠 <b>Админ-панель</b>\nВыберите действие:", reply_markup=get_admin_kb())
+
+# ── БЛОКИРОВКА / РАЗБЛОКИРОВКА ──────────────────────────────────────────────
+
+@dp.callback_query(F.data == "admin_block")
+async def cb_admin_block(cq: CallbackQuery, state: FSMContext):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    await state.set_state(AdminState.waiting_for_block_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back")]])
+    await cq.message.edit_text("🔒 Отправьте ID пользователя, которого нужно <b>заблокировать</b>:", reply_markup=kb)
+
+@dp.callback_query(F.data == "admin_unblock")
+async def cb_admin_unblock(cq: CallbackQuery, state: FSMContext):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    await state.set_state(AdminState.waiting_for_unblock_id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back")]])
+    await cq.message.edit_text("🔓 Отправьте ID пользователя, которого нужно <b>разблокировать</b>:", reply_markup=kb)
+
+@dp.message(AdminState.waiting_for_block_id)
+async def process_block(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    if not message.text.isdigit():
+        await message.answer("⚠️ ID должен состоять только из цифр. Попробуйте снова.")
+        return
+    uid = int(message.text)
+    await state.clear()
+    supabase.table("users").update({"status": "blocked"}).eq("id", uid).execute()
+    try: await bot.send_message(uid, "🔒 <b>Доступ заблокирован.</b>\nСвяжитесь с администратором: @GaspardShop")
+    except Exception: pass
+    await message.answer(f"✅ Пользователь <code>{uid}</code> заблокирован.", reply_markup=get_admin_kb())
+
+@dp.message(AdminState.waiting_for_unblock_id)
+async def process_unblock(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    if not message.text.isdigit():
+        await message.answer("⚠️ ID должен состоять только из цифр. Попробуйте снова.")
+        return
+    uid = int(message.text)
+    await state.clear()
+    supabase.table("users").update({"status": "approved"}).eq("id", uid).execute()
+    try: await bot.send_message(uid, "✅ <b>Ваш доступ восстановлен!</b>\nДобро пожаловать обратно в «Глазок».")
+    except Exception: pass
+    await message.answer(f"✅ Пользователь <code>{uid}</code> разблокирован.", reply_markup=get_admin_kb())
+
+# ── ЛИЧНЫЕ СООБЩЕНИЯ ────────────────────────────────────────────────────────
+
+@dp.callback_query(F.data == "admin_msg_user")
+async def cb_admin_msg_user(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    
+    res = supabase.table("users").select("id, first_name, last_name").neq("id", ADMIN_ID).eq("status", "approved").limit(30).execute()
+    users = res.data if res.data else []
+    if not users:
+        await cq.message.edit_text("Нет одобренных пользователей.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")]]))
+        return
+        
+    kb_buttons = []
+    for u in users:
+        name = f"{u.get('first_name') or ''} {u.get('last_name') or ''}".strip()
+        if not name: name = str(u['id'])
+        kb_buttons.append([InlineKeyboardButton(text=f"👤 {name}", callback_data=f"admin_msg_sel:{u['id']}")])
+        
+    kb_buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_back")])
+    await cq.message.edit_text("✉️ <b>Кому отправить сообщение?</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
+
+@dp.callback_query(F.data.startswith("admin_msg_sel:"))
+async def cb_admin_msg_sel(cq: CallbackQuery, state: FSMContext):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    target_id = int(cq.data.split(":")[1])
+    await state.update_data(target_id=target_id)
+    await state.set_state(AdminState.waiting_for_user_msg)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back")]])
+    await cq.message.edit_text(f"✍️ Отправьте текст или фото (с подписью) для пользователя <code>{target_id}</code>:", reply_markup=kb)
+
+@dp.message(AdminState.waiting_for_user_msg)
+async def process_user_msg(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    data = await state.get_data()
+    target_id = data["target_id"]
+    await state.clear()
+    
+    try:
+        if message.photo:
+            await bot.send_photo(target_id, message.photo[-1].file_id, caption=message.caption or "")
+        elif message.text:
+            await bot.send_message(target_id, message.text)
+        else:
+            await message.answer("⚠️ Поддерживается только текст или фото.")
+            return
+        await message.answer(f"✅ Сообщение доставлено пользователю <code>{target_id}</code>.", reply_markup=get_admin_kb())
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отправить: {e}", reply_markup=get_admin_kb())
+
+# ── РАССЫЛКА (С ФОТО И УДАЛЕНИЕМ) ───────────────────────────────────────────
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def cb_admin_broadcast(cq: CallbackQuery, state: FSMContext):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    await state.set_state(AdminState.waiting_for_broadcast)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back")]])
+    await cq.message.edit_text("📢 <b>Режим рассылки</b>\n\nОтправьте текст или фото (с подписью), которое получат ВСЕ пользователи:", reply_markup=kb)
+
+@dp.message(AdminState.waiting_for_broadcast)
+async def process_broadcast(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID: return
+    await state.clear()
+    
+    res = supabase.table("users").select("id").eq("status", "approved").execute()
+    users = res.data if res.data else []
+    if not users:
+        await message.answer("В базе нет одобренных пользователей.", reply_markup=get_admin_kb())
+        return
+        
+    status_msg = await message.answer("⏳ Начинаю рассылку...")
+    batch_id = str(uuid.uuid4())
+    success, failed = 0, 0
+    
+    for u in users:
+        try:
+            if message.photo:
+                sent_msg = await bot.send_photo(u["id"], message.photo[-1].file_id, caption=message.caption or "")
+            else:
+                sent_msg = await bot.send_message(u["id"], message.text)
+                
+            # Сохраняем в историю для возможности удаления
+            supabase.table("broadcast_history").insert({
+                "batch_id": batch_id, "user_id": u["id"], "message_id": sent_msg.message_id
+            }).execute()
+            success += 1
+        except Exception:
+            failed += 1
+            
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")]
+        [InlineKeyboardButton(text="🗑 Удалить эту рассылку у всех", callback_data=f"del_broadcast:{batch_id}")],
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="admin_back")]
     ])
-    await message.answer("🛠 <b>Админ-панель</b>\nВыберите действие:", reply_markup=kb)
+    await status_msg.edit_text(f"✅ <b>Рассылка завершена!</b>\n\nУспешно: {success}\nЗаблокировали бота: {failed}", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("del_broadcast:"))
+async def cb_del_broadcast(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    batch_id = cq.data.split(":")[1]
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить везде", callback_data=f"confirm_del:{batch_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back")]
+    ])
+    await cq.message.edit_text("⚠️ Вы уверены, что хотите удалить эту рассылку у всех пользователей?", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("confirm_del:"))
+async def cb_confirm_del(cq: CallbackQuery):
+    if cq.from_user.id != ADMIN_ID: return
+    await safe_answer(cq)
+    batch_id = cq.data.split(":")[1]
+    
+    await cq.message.edit_text("⏳ Удаляю сообщения...")
+    res = supabase.table("broadcast_history").select("user_id, message_id").eq("batch_id", batch_id).execute()
+    records = res.data if res.data else []
+    
+    success, failed = 0, 0
+    for r in records:
+        try:
+            await bot.delete_message(r["user_id"], r["message_id"])
+            success += 1
+        except Exception:
+            failed += 1
+            
+    supabase.table("broadcast_history").delete().eq("batch_id", batch_id).execute()
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ В меню", callback_data="admin_back")]])
+    await cq.message.edit_text(f"✅ <b>Удаление завершено!</b>\n\nУспешно удалено: {success}\nНе удалось (прошло >48ч): {failed}", reply_markup=kb)
+
+# ── СТАРЫЕ ФУНКЦИИ ПОЛЬЗОВАТЕЛЕЙ (БЕЗ ИЗМЕНЕНИЙ) ────────────────────────────
 
 @dp.callback_query(F.data == "admin_users")
 async def cb_admin_users(cq: CallbackQuery):
@@ -289,15 +542,6 @@ async def cb_admin_users(cq: CallbackQuery):
         await cq.message.edit_text(text, reply_markup=kb)
     except Exception:
         await cq.message.answer(text, reply_markup=kb)
-
-@dp.callback_query(F.data == "admin_back")
-async def cb_admin_back(cq: CallbackQuery):
-    if cq.from_user.id != ADMIN_ID: return
-    await safe_answer(cq)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")]
-    ])
-    await cq.message.edit_text("🛠 <b>Админ-панель</b>\nВыберите действие:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("admin_user:"))
 async def cb_admin_user_card(cq: CallbackQuery):
@@ -338,16 +582,12 @@ async def cb_admin_deny(cq: CallbackQuery):
     supabase.table("users").update({"status": "blocked"}).eq("id", uid).execute()
     await safe_answer(cq, "Пользователь заблокирован", show_alert=True)
     
-    # --- ДОБАВЛЕНО: Уведомление пользователю при ручной блокировке ---
     try:
         await bot.send_message(uid, "🔒 <b>Доступ заблокирован.</b>\nСвяжитесь с администратором для восстановления: @GaspardShop")
     except Exception as e:
         logger.warning(f"Could not send block notify: {e}")
-    # ------------------------------------------------------------------
     
     await cb_admin_user_card(cq)
-
-# ── Установка срока ─────────────────────────────────────────────────────────
 
 @dp.callback_query(F.data.startswith("term_menu:"))
 async def cb_term_menu(cq: CallbackQuery):
@@ -371,7 +611,6 @@ async def cb_term_menu(cq: CallbackQuery):
     
     await cq.message.edit_text(text, reply_markup=kb)
 
-# ИЗМЕНЕНО: Умное добавление дней и отправка уведомления с кнопкой подключения
 @dp.callback_query(F.data.startswith("term_set:"))
 async def cb_term_set(cq: CallbackQuery):
     if cq.from_user.id != ADMIN_ID: return
@@ -382,7 +621,6 @@ async def cb_term_set(cq: CallbackQuery):
     days = int(parts[2])
     target_type = parts[3]
     
-    # Определяем ID пользователя (из заявки или напрямую)
     user_id = target_id
     if target_type != "user":
         req = fetch_one(supabase.table("access_requests").select("user_id").eq("id", target_id))
@@ -392,7 +630,6 @@ async def cb_term_set(cq: CallbackQuery):
         await cq.message.edit_text("Ошибка: пользователь не найден.")
         return
 
-    # Получаем текущую дату окончания
     u_data = fetch_one(supabase.table("users").select("valid_until").eq("id", user_id))
     current_valid = u_data.get("valid_until") if u_data else None
     
@@ -405,41 +642,36 @@ async def cb_term_set(cq: CallbackQuery):
             try:
                 curr_dt = datetime.fromisoformat(current_valid.replace("Z", "+00:00"))
                 if curr_dt > now:
-                    # Срок еще активен — прибавляем дни к текущему сроку
                     valid_until = (curr_dt + timedelta(days=days)).isoformat()
                     is_extending = True
                 else:
-                    # Срок уже истек — отсчитываем от сегодня
                     valid_until = (now + timedelta(days=days)).isoformat()
             except ValueError:
                 valid_until = (now + timedelta(days=days)).isoformat()
         else:
-            # Срока не было — отсчитываем от сегодня
             valid_until = (now + timedelta(days=days)).isoformat()
 
-    # Формируем текст уведомления
     if valid_until:
         if is_extending:
-            # КУРСИВ для текста добавления, ЖИРНЫЙ для даты
             user_text = f"<i>Вам добавлено {days} дн. к текущему сроку.</i>\nНовая дата окончания: <b>{fmt_dt(valid_until)}</b>\n\nДля продления в будущем обращайтесь: @GaspardShop"
         else:
             user_text = f"✅ <b>Вам установлен срок доступа!</b>\n\nВаш доступ к боту «Глазок» активен до: <b>{fmt_dt(valid_until)}</b>.\n\nПо окончании срока вам потребуется продлить его у администратора (@GaspardShop)."
     else:
         user_text = "✅ <b>Вам выдан бессрочный доступ!</b>\n\nДобро пожаловать в «Глазок»."
 
-    # Кнопка подключения
     user_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔌 Подключить Глазок", callback_data="user_connect")]
     ])
 
     if target_type == "user":
-        supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", target_id).execute()
+        # Сбрасываем флаги уведомлений!
+        supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False, "expiry_warning_notified": False}).eq("id", target_id).execute()
         try: await bot.send_message(target_id, user_text, reply_markup=user_kb)
         except Exception as e: logger.warning(f"Could not send term notify to {target_id}: {e}")
     else:
         req = fetch_one(supabase.table("access_requests").select("user_id").eq("id", target_id))
         if req:
-            supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", req["user_id"]).execute()
+            supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False, "expiry_warning_notified": False}).eq("id", req["user_id"]).execute()
             supabase.table("access_requests").update({"status": "approved", "resolved_at": now_utc().isoformat()}).eq("id", target_id).execute()
             
             try: 
@@ -464,7 +696,6 @@ async def cb_term_manual(cq: CallbackQuery, state: FSMContext):
     
     await cq.message.edit_text("✍️ Отправьте дату и время в формате:\n<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\nПример: <code>31.12.2026 23:59</code>")
 
-# ИЗМЕНЕНО: Отправка уведомления при ручном вводе даты
 @dp.message(AdminState.waiting_for_custom_date)
 async def process_custom_date(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
@@ -481,16 +712,15 @@ async def process_custom_date(message: types.Message, state: FSMContext):
     target_type = data["target_type"]
     await state.clear()
     
-    # Текст для пользователя
     user_text = f"✅ <b>Вам установлен срок доступа!</b>\n\nВаш доступ к боту «Глазок» активен до: <b>{fmt_dt(valid_until)}</b>.\n\nПо окончании срока вам потребуется продлить его у администратора (@GaspardShop)."
     
-    # Кнопка подключения
     user_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔌 Подключить Глазок", callback_data="user_connect")]
     ])
     
     if target_type == "user":
-        supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", target_id).execute()
+        # Сбрасываем флаги уведомлений!
+        supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False, "expiry_warning_notified": False}).eq("id", target_id).execute()
         try: await bot.send_message(target_id, user_text, reply_markup=user_kb)
         except Exception as e: logger.warning(f"Could not send term notify to {target_id}: {e}")
         
@@ -498,7 +728,7 @@ async def process_custom_date(message: types.Message, state: FSMContext):
     else:
         req = fetch_one(supabase.table("access_requests").select("user_id").eq("id", target_id))
         if req:
-            supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", req["user_id"]).execute()
+            supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False, "expiry_warning_notified": False}).eq("id", req["user_id"]).execute()
             supabase.table("access_requests").update({"status": "approved", "resolved_at": now_utc().isoformat()}).eq("id", target_id).execute()
             
             try: 
@@ -509,7 +739,6 @@ async def process_custom_date(message: types.Message, state: FSMContext):
 
 # ── Стандартные команды ──────────────────────────────────────────────────────
 
-# ИЗМЕНЕНО: Отправляем starti.PNG при старте
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -631,7 +860,6 @@ async def cb_show_instructions_info(cq: CallbackQuery):
     )
     await safe_answer(cq, text, show_alert=True)
 
-# ИЗМЕНЕНО: При нажатии на кнопку подключения удаляем старое сообщение и присылаем фото с инструкцией
 @dp.callback_query(F.data == "user_connect")
 async def cb_user_connect(cq: CallbackQuery):
     await safe_answer(cq)
@@ -646,7 +874,6 @@ async def cb_user_connect(cq: CallbackQuery):
         logger.warning(f"Could not send instruction photo: {e}")
         await cq.message.answer(text, reply_markup=kb)
 
-# ИЗМЕНЕНО: При нажатии "Разрешить" удаляем сообщение с заявкой и показываем меню сроков
 @dp.callback_query(F.data.startswith("approve:"))
 async def cb_approve(cq: CallbackQuery):
     if cq.from_user.id != ADMIN_ID:
@@ -693,7 +920,7 @@ async def cmd_broadcast(message: types.Message):
         return
     text = message.text.replace("/broadcast", "").strip()
     if not text:
-        await message.answer("⚠️ Использование: <code>/broadcast Текст сообщения</code>")
+        await message.answer("⚠️ Использование: <code>/broadcast Текст сообщения</code>\nИли воспользуйтесь /admin для рассылки с фото.")
         return
     
     await message.answer("⏳ Начинаю рассылку...")
@@ -833,7 +1060,6 @@ async def on_business_connection(conn: types.BusinessConnection):
     }, on_conflict="id").execute()
 
     if conn.is_enabled:
-        # УБРАНА ИНЛАЙН КНОПКА ОТКРЫТИЯ МИНИ ЭП
         text = (
             "✅ <b>Бот успешно подключён к автоматизации чатов!</b>\n\n"
             "Теперь я буду сохранять историю сообщений и присылать уведомления, "
