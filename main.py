@@ -382,11 +382,10 @@ async def render_referral(user_id: int):
         + (f"⏳ Ожидают одобрения: <b>{pending}</b>\n" if pending else "")
         + (f"⚠️ Не зачтено: <b>{cancelled}</b>\n" if cancelled else "")
     )
-    share_url = f"https://t.me/share/url?url={link}"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
             text="📤 Поделиться", 
-            url=share_url
+            switch_inline_query=share_text
         )],
         [InlineKeyboardButton(text="📋 Мои приглашения", callback_data="my_referrals_list")],
     ])
