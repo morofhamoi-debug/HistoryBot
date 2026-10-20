@@ -10,7 +10,7 @@ import time
 import uuid
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, quote
 from typing import Optional
 
 import uvicorn
@@ -817,7 +817,8 @@ async def cmd_start(message: types.Message):
         resize_keyboard=True,
         is_persistent=True
     )
-    await message.answer("🛠 <b>Меню активировано.</b>" if message.from_user.id == ADMIN_ID else "👋 <b>Меню активировано.</b>", reply_markup=reply_kb)
+    # ИЗМЕНЕНО: Отправляем невидимый символ вместо текста "Меню активировано"
+    await message.answer("\u200b", reply_markup=reply_kb)
 
     caption = (
         "👋 Добро пожаловать в «Глазок»!\n"
@@ -842,6 +843,10 @@ async def handle_referral(message: types.Message):
         bot_username = "KhamoiHistory_Bot"
 
     ref_link = f"https://t.me/{bot_username}?start=ref_{message.from_user.id}"
+    
+    # ИСПРАВЛЕНО: Кодируем ссылку и текст, чтобы Telegram понимал пробелы
+    share_text = "Привет! Попробуй бота Глазок, он сохраняет удаленные сообщения. Переходи по моей ссылке!"
+    share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={quote(share_text)}"
 
     text = (
         "🎁 <b>Реферальная программа «Глазок»</b>\n\n"
@@ -852,7 +857,7 @@ async def handle_referral(message: types.Message):
     )
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Поделиться ссылкой", url=f"https://t.me/share/url?url={ref_link}&text=Привет! Попробуй бота Глазок, он сохраняет удаленные сообщения. Переходи по моей ссылке!")],
+        [InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share_url)],
         [InlineKeyboardButton(text="📋 Скопировать ссылку", copy_text=types.CopyTextButton(text=ref_link))]
     ])
 
@@ -1133,9 +1138,9 @@ async def cmd_myid(message: types.Message):
 @dp.message(Command("support"))
 async def cmd_support(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💬 Написать @GaspardShop", url="https://t.me/GaspardShop")]
+        [InlineKeyboardButton(text="💬 Нап awaitисать @Gasp messageardShop", url="https://t.me/GaspardShop.")]
     ])
-    await message.answer(
+   answer(
         "💬 <b>Служба поддержки</b>\n\n"
         "По всем вопросам (продление доступа, ошибки, предложения) "
         "обращайтесь к администратору по кнопке ниже:",
