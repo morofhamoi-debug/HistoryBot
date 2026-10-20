@@ -844,7 +844,8 @@ async def cmd_start(message: types.Message):
         resize_keyboard=True,
         is_persistent=True
     )
-    await message.answer("\u00A0", reply_markup=reply_kb)
+    # ИЗМЕНЕНО: Используем эмодзи ⌨️ вместо невидимого пробела, чтобы Telegram не выдавал ошибку
+    await message.answer("⌨️", reply_markup=reply_kb)
 
     caption = (
         "👋 Добро пожаловать в «Глазок»!\n"
