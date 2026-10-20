@@ -254,7 +254,8 @@ async def check_expirations():
                 for u in res_warn.data:
                     uid = u["id"]
                     try:
-                        await bot.send_message(uid, "⚠️ <b>Внимание! Ваш доступ скоро закончится.</b>\n\nДоступ к боту «Глазок» будет приостановлен через 3 дня (или меньше).\nЧтобы не потерять историю, продлите доступ заранее.\n\nСвязаться с администратором: @GaspardShop")
+                        await bot.send_message(uid, "⚠️ <b>Внимание! Ва)
+ш доступ скоро закончится.</b>\n\nДоступ к боту «Глазок» будет приостановлен через 3 дня (или меньше).\nЧтобы не потерять историю, продлите доступ заранее.\n\nСвязаться с администратором: @GaspardShop")
                         supabase.table("users").update({"expiry_warning_notified": True}).eq("id", uid).execute()
                     except Exception as e:
                         logger.warning(f"Could not send warning message to {uid}: {e}")
@@ -263,8 +264,7 @@ async def check_expirations():
         except Exception as e:
             logger.error(f"Error in check_expirations: {e}")
             
-        await asyncio.sleep(300)
-# ────────────────────────────────────────────────────────────────────────────
+        await asyncio.sleep(300# ────────────────────────────────────────────────────────────────────────────
 
 def upsert_chat(connection_id: str, chat: types.Chat, owner_id: int):
     supabase.table("chats").upsert({
@@ -478,9 +478,9 @@ async def cb_admin_broadcast(cq: CallbackQuery, state: FSMContext):
     await safe_answer(cq)
     await state.set_state(AdminState.waiting_for_broadcast)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back")]])
-    await cq.message.edit_text("📢 <b>Режим рассылки</b>\n\nОтправьте текст или фото (с подписью), которое получат ВСЕ пользователи:", reply_markup=kb)
+    await cq.message.edit_text("📢 <b>Режим рассылки</b>\n\nОтправьте текст или фото (с подписью), которое получат ВСЕ пользователи:", reply_m kbarkup=kb)
 
-@dp.message(AdminState.waiting_for_broadcast)
+@ =dp.message(AdminState In.waiting_for_broadcast)
 async def process_broadcast(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID: return
     await state.clear()
@@ -510,7 +510,7 @@ async def process_broadcast(message: types.Message, state: FSMContext):
         except Exception:
             failed += 1
             
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+   lineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗑 Удалить эту рассылку у всех", callback_data=f"del_broadcast:{batch_id}")],
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="admin_back")]
     ])
@@ -817,8 +817,8 @@ async def cmd_start(message: types.Message):
         resize_keyboard=True,
         is_persistent=True
     )
-    # ИЗМЕНЕНО: Отправляем невидимый символ вместо текста "Меню активировано"
-    await message.answer("\u200b", reply_markup=reply_kb)
+    # ИЗМЕНЕНО: Используем неразрывный пробел (\u00A0), чтобы Telegram не выдавал ошибку пустого текста
+    await message.answer("\u00A0", reply_markup=reply_kb)
 
     caption = (
         "👋 Добро пожаловать в «Глазок»!\n"
