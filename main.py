@@ -190,69 +190,85 @@ def is_user_active(user_id: int) -> bool:
             pass
     return True
 
-# ДОБАВЛЕНО: Функция начисления реферального бонуса
-async def give_referral_bonus(uid: int):
-    u = fetch_one(supabase.table("users").select("referred_by", "valid_until").eq("id", uid))
-    if not u or not u.get("referred_by"):
-        return
-
-    referrer_id = u["referred_by"]
-    if referrer_id == uid:
-        return
-
-    now = now_utc()
-    
-    # 1. Бонус новому пользователю (+3 дня)
-    new_user_valid = u.get("valid_until")
-    if new_user_valid:
-        try:
-            curr_dt = datetime.fromisoformat(new_user_valid.replace("Z", "+00:00"))
-            if curr_dt > now:
-                new_user_valid = (curr_dt + timedelta(days=3)).isoformat()
-            else:
-                new_user_valid = (now + timedelta(days=3)).isoformat()
-        except ValueError:
-            new_user_valid = (now + timedelta(days=3)).isoformat()
-    else:
-        new_user_valid = (now + timedelta(days=3)).isoformat()
-
-    supabase.table("users").update({"valid_until": new_user_valid}).eq("id", uid).execute()
+# ── ДОБАВЛЕНО: Начисление реферального бонуса ───────────────────────────────
+async def award_referral_bonus(user_id: int):
     try:
-        await bot.send_message(uid, f"🎁 <b>Реферальный бонус!</b>\n\nВам начислено <b>+3 дня</b> к доступу за то, что вы перешли по ссылке друга.\nНовая дата окончания: <b>{fmt_dt(new_user_valid)}</b>")
-    except Exception:
-        pass
+        user = fetch_one(supabase.table("users").select("*").eq("id", user_id))
+        if not user:
+            return
+        referrer_id = user.get("referred_by")
+        if not referrer_id:
+            return
+        if referrer_id == user_id:
+            return
 
-    # 2. Увеличиваем счетчик приглашенных у пригласившего
-    ref_data = fetch_one(supabase.table("users").select("valid_until", "invited_count").eq("id", referrer_id))
-    if ref_data:
-        new_count = (ref_data.get("invited_count") or 0) + 1
-        supabase.table("users").update({"invited_count": new_count}).eq("id", referrer_id).execute()
+        now = now_utc()
 
-        # 3. Бонус пригласившему (+3 дня, если не бесконечно)
-        ref_valid = ref_data.get("valid_until")
-        if ref_valid is None:
+        # Шаг 5.1: +3 дня другу
+        friend_valid = user.get("valid_until")
+        if friend_valid:
             try:
-                await bot.send_message(referrer_id, f"🎉 <b>Бонус за друга!</b>\n\nПользователь, которого вы пригласили, получил доступ.\nТак как у вас <b>бессрочный</b> доступ, дополнительные дни не начислены.\n\n👥 Всего приглашено: <b>{new_count} чел.</b>")
-            except Exception:
-                pass
-        else:
-            try:
-                curr_dt = datetime.fromisoformat(ref_valid.replace("Z", "+00:00"))
-                if curr_dt > now:
-                    new_ref_valid = (curr_dt + timedelta(days=3)).isoformat()
+                curr = datetime.fromisoformat(friend_valid.replace("Z", "+00:00"))
+                if curr > now:
+                    new_valid = (curr + timedelta(days=3)).isoformat()
                 else:
-                    new_ref_valid = (now + timedelta(days=3)).isoformat()
+                    new_valid = (now + timedelta(days=3)).isoformat()
             except ValueError:
-                new_ref_valid = (now + timedelta(days=3)).isoformat()
+                new_valid = (now + timedelta(days=3)).isoformat()
+        else:
+            new_valid = (now + timedelta(days=3)).isoformat()
 
-            supabase.table("users").update({"valid_until": new_ref_valid}).eq("id", referrer_id).execute()
-            try:
-                await bot.send_message(referrer_id, f"🎉 <b>Бонус за друга!</b>\n\nПользователь, которого вы пригласили, получил доступ. Вам начислено <b>+3 дня</b> к текущему сроку.\nНовая дата окончания: <b>{fmt_dt(new_ref_valid)}</b>\n\n👥 Всего приглашено: <b>{new_count} чел.</b>")
-            except Exception:
-                pass
+        supabase.table("users").update({"valid_until": new_valid}).eq("id", user_id).execute()
 
-    # Очищаем referred_by, чтобы не было двойных начислений
-    supabase.table("users").update({"referred_by": None}).eq("id", uid).execute()
+        try:
+            await bot.send_message(
+                user_id,
+                f"🎁 <b>Реферальный бонус!</b>\nВам начислено +3 дня.\nНовая дата окончания: <b>{fmt_dt(new_valid)}</b>"
+            )
+        except Exception:
+            pass
+
+        # Шаг 5.2: счётчик у пригласившего
+        referrer = fetch_one(supabase.table("users").select("*").eq("id", referrer_id))
+        if referrer:
+            new_count = (referrer.get("referral_count") or 0) + 1
+            supabase.table("users").update({"referral_count": new_count}).eq("id", referrer_id).execute()
+
+            # Шаг 5.3: бонус пригласившему
+            ref_valid = referrer.get("valid_until")
+            if not ref_valid:
+                try:
+                    await bot.send_message(
+                        referrer_id,
+                        f"🎉 <b>Бонус за друга!</b>\nТак как у вас бессрочный доступ, дополнительные дни не начислены.\nВсего приглашено: <b>{new_count} чел.</b>"
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    curr_ref = datetime.fromisoformat(ref_valid.replace("Z", "+00:00"))
+                    if curr_ref > now:
+                        new_ref_valid = (curr_ref + timedelta(days=3)).isoformat()
+                    else:
+                        new_ref_valid = (now + timedelta(days=3)).isoformat()
+                except ValueError:
+                    new_ref_valid = (now + timedelta(days=3)).isoformat()
+
+                supabase.table("users").update({"valid_until": new_ref_valid}).eq("id", referrer_id).execute()
+
+                try:
+                    await bot.send_message(
+                        referrer_id,
+                        f"🎉 <b>Бонус за друга!</b>\nВам начислено +3 дня.\nНовая дата окончания: <b>{fmt_dt(new_ref_valid)}</b>\nВсего приглашено: <b>{new_count} чел.</b>"
+                    )
+                except Exception:
+                    pass
+
+        # Шаг 5.4: защита от повторного начисления
+        supabase.table("users").update({"referred_by": None}).eq("id", user_id).execute()
+    except Exception as e:
+        logger.error(f"Error in award_referral_bonus: {e}")
+# ────────────────────────────────────────────────────────────────────────────
 
 # ── ДОБАВЛЕНО ИЗМЕНЕНИЕ: Фоновая задача (добавлено предупреждение за 3 дня) ──
 async def check_expirations():
@@ -331,6 +347,45 @@ async def get_instruction_msg():
         [InlineKeyboardButton(text="? Инструкция", callback_data="show_instructions_info")]
     ])
     return text, kb
+
+# ── ДОБАВЛЕНО: Обработчик кнопки реферальной программы ──────────────────────
+@dp.message(F.text == "🎁 Реферальная программа")
+async def handle_referral_program(message: types.Message):
+    user_id = message.from_user.id
+
+    try:
+        bot_info = await bot.get_me()
+        bot_username = bot_info.username
+    except Exception:
+        bot_username = "KhamoiHistory_Bot"
+
+    ref_link = f"https://t.me/{bot_username}?start=ref_{user_id}"
+
+    share_text = (
+        f"Привет! Попробуй бота «Глазок» — он сохраняет историю сообщений "
+        f"и присылает уведомления об удалённых.\n\n{ref_link}"
+    )
+    share_url = f"https://t.me/share/url?text={quote(share_text, safe='')}"
+
+    user_row = fetch_one(supabase.table("users").select("referral_count").eq("id", user_id))
+    count = (user_row.get("referral_count") if user_row else 0) or 0
+
+    text = (
+        "🎁 <b>Реферальная программа</b>\n\n"
+        "За каждого одобренного друга:\n"
+        "• +3 дня тебе\n"
+        "• +3 дня другу\n\n"
+        f"<b>Вы пригласили:</b> {count} чел.\n\n"
+        "Отправьте эту ссылку другу:"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share_url)],
+        [InlineKeyboardButton(text="📋 Скопировать ссылку", copy_text=types.CopyTextButton(text=ref_link))]
+    ])
+
+    await message.answer(text, reply_markup=kb)
+# ────────────────────────────────────────────────────────────────────────────
 
 # ── Aiogram: Админ-панель ────────────────────────────────────────────────────
 
@@ -732,7 +787,8 @@ async def cb_term_set(cq: CallbackQuery):
         supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False, "expiry_warning_notified": False}).eq("id", target_id).execute()
         try: await bot.send_message(target_id, user_text, reply_markup=user_kb)
         except Exception as e: logger.warning(f"Could not send term notify to {target_id}: {e}")
-        await give_referral_bonus(target_id) # ДОБАВЛЕНО: Бонус за друга
+        # ДОБАВЛЕНО: начисление реферального бонуса
+        await award_referral_bonus(target_id)
     else:
         req = fetch_one(supabase.table("access_requests").select("user_id").eq("id", target_id))
         if req:
@@ -742,8 +798,8 @@ async def cb_term_set(cq: CallbackQuery):
             try: 
                 await bot.send_message(req["user_id"], user_text, reply_markup=user_kb)
             except Exception as e: logger.warning(f"Could not send term notify to {req['user_id']}: {e}")
-            
-            await give_referral_bonus(req["user_id"]) # ДОБАВЛЕНО: Бонус за друга
+            # ДОБАВЛЕНО: начисление реферального бонуса
+            await award_referral_bonus(req["user_id"])
 
     await cq.message.edit_text("✅ Срок успешно установлен.")
     await asyncio.sleep(1.5)
@@ -790,8 +846,9 @@ async def process_custom_date(message: types.Message, state: FSMContext):
         supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False, "expiry_warning_notified": False}).eq("id", target_id).execute()
         try: await bot.send_message(target_id, user_text, reply_markup=user_kb)
         except Exception as e: logger.warning(f"Could not send term notify to {target_id}: {e}")
+        # ДОБАВЛЕНО: начисление реферального бонуса
+        await award_referral_bonus(target_id)
         
-        await give_referral_bonus(target_id) # ДОБАВЛЕНО: Бонус за друга
         await message.answer(f"✅ Срок установлен до: {fmt_dt(valid_until)}")
     else:
         req = fetch_one(supabase.table("access_requests").select("user_id").eq("id", target_id))
@@ -802,50 +859,56 @@ async def process_custom_date(message: types.Message, state: FSMContext):
             try: 
                 await bot.send_message(req["user_id"], user_text, reply_markup=user_kb)
             except Exception as e: logger.warning(f"Could not send term notify to {req['user_id']}: {e}")
+            # ДОБАВЛЕНО: начисление реферального бонуса
+            await award_referral_bonus(req["user_id"])
             
-            await give_referral_bonus(req["user_id"]) # ДОБАВЛЕНО: Бонус за друга
         await message.answer(f"✅ Пользователь одобрен, срок до: {fmt_dt(valid_until)}")
 
 # ── Стандартные команды ──────────────────────────────────────────────────────
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    # ДОБАВЛЕНО: Обработка реферальной ссылки
-    args = message.text.split()
-    if len(args) > 1 and args[1].startswith("ref_"):
+    # ДОБАВЛЕНО: обработка реферальной ссылки ?start=ref_XXX
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1 and parts[1].startswith("ref_"):
         try:
-            referrer_id = int(args[1].replace("ref_", ""))
+            referrer_id = int(parts[1][4:])
             if referrer_id != message.from_user.id:
-                existing = fetch_one(supabase.table("users").select("referred_by").eq("id", message.from_user.id))
+                existing = fetch_one(supabase.table("users").select("id, referred_by").eq("id", message.from_user.id))
                 if existing:
                     if not existing.get("referred_by"):
                         supabase.table("users").update({"referred_by": referrer_id}).eq("id", message.from_user.id).execute()
                 else:
                     status = "approved" if message.from_user.id == ADMIN_ID else "pending"
                     supabase.table("users").insert({
-                        "id": message.from_user.id, "first_name": message.from_user.first_name,
-                        "last_name": message.from_user.last_name, "username": message.from_user.username,
-                        "status": status, "referred_by": referrer_id
+                        "id": message.from_user.id,
+                        "first_name": message.from_user.first_name,
+                        "last_name": message.from_user.last_name,
+                        "username": message.from_user.username,
+                        "status": status,
+                        "referred_by": referrer_id,
                     }).execute()
-        except ValueError:
+        except (ValueError, IndexError):
             pass
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Начать пользоваться", callback_data="start_usage")]
     ])
     
-    # ДОБАВЛЕНО: Кнопки над клавиатурой для всех
-    reply_kb_buttons = [[types.KeyboardButton(text="🎁 Реферальная программа")]]
     if message.from_user.id == ADMIN_ID:
-        reply_kb_buttons.insert(0, [types.KeyboardButton(text="👥 Пользователи")])
-        
-    reply_kb = types.ReplyKeyboardMarkup(
-        keyboard=reply_kb_buttons,
-        resize_keyboard=True,
-        is_persistent=True
-    )
-    # ИЗМЕНЕНО: Используем эмодзи ⌨️ вместо невидимого пробела, чтобы Telegram не выдавал ошибку
-    await message.answer("⌨️", reply_markup=reply_kb)
+        admin_kb = types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="👥 Пользователи"), types.KeyboardButton(text="🎁 Реферальная программа")]],
+            resize_keyboard=True,
+            is_persistent=True
+        )
+        await message.answer("🛠 <b>Режим администратора активирован.</b>", reply_markup=admin_kb)
+    else:
+        user_kb = types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="🎁 Реферальная программа")]],
+            resize_keyboard=True,
+            is_persistent=True
+        )
+        await message.answer("👇 Меню бота:", reply_markup=user_kb)
 
     caption = (
         "👋 Добро пожаловать в «Глазок»!\n"
@@ -859,41 +922,6 @@ async def cmd_start(message: types.Message):
     except Exception as e:
         logger.error(f"Не удалось отправить фото /start: {e}")
         await message.answer(caption, reply_markup=kb)
-
-# ДОБАВЛЕНО: Обработчик кнопки "🎁 Реферальная программа"
-@dp.message(F.text == "🎁 Реферальная программа")
-async def handle_referral(message: types.Message):
-    try:
-        bot_info = await bot.get_me()
-        bot_username = bot_info.username
-    except Exception:
-        bot_username = "KhamoiHistory_Bot"
-
-    ref_link = f"https://t.me/{bot_username}?start=ref_{message.from_user.id}"
-    
-    # ИСПРАВЛЕНО: Кодируем ссылку и текст, чтобы Telegram понимал пробелы
-    share_text = "Привет! Попробуй бота Глазок, он сохраняет удаленные сообщения. Переходи по моей ссылке!"
-    share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={quote(share_text)}"
-
-    # ИЗМЕНЕНО: Достаем счетчик приглашенных
-    u = fetch_one(supabase.table("users").select("invited_count").eq("id", message.from_user.id))
-    count = u.get("invited_count", 0) if u else 0
-
-    text = (
-        "🎁 <b>Реферальная программа «Глазок»</b>\n\n"
-        "Приглашайте друзей и получайте бонусные дни доступа!\n\n"
-        "За каждого друга, который перейдет по вашей ссылке и <b>получит одобрение администратора</b>, "
-        "вы получите <b>+3 дня</b> к вашему текущему доступу. А ваш друг получит <b>+3 дня</b> к своему!\n\n"
-        f"👥 Вы пригласили: <b>{count} чел.</b>\n\n"
-        "Отправьте эту ссылку другу:"
-    )
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📤 Поделиться ссылкой", url=share_url)],
-        [InlineKeyboardButton(text="📋 Скопировать ссылку", copy_text=types.CopyTextButton(text=ref_link))]
-    ])
-
-    await message.answer(text, reply_markup=kb)
 
 @dp.message(F.text == "👥 Пользователи")
 async def handle_admin_users_btn(message: types.Message):
