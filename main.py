@@ -297,11 +297,11 @@ async def cb_admin_back(cq: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")]
     ])
-    await cq.message.edit_text("🛠 <b>Админ-панель</b>\nВыберитеabase.table действие:", reply_markup=kb)
+    await cq.message.edit_text("🛠 <b>Админ-панель</b>\nВыберите действие:", reply_markup=kb)
 
-("@dp.callback_query(F.data.startswith("admin_user:"))
+@dp.callback_query(F.data.startswith("admin_user:"))
 async def cb_admin_user_card(cq: CallbackQuery):
-users    if cq.from_user")..id != ADMIN_ID: return
+    if cq.from_user.id != ADMIN_ID: return
     await safe_answer(cq)
     
     uid = int(cq.data.split(":")[1])
@@ -490,7 +490,7 @@ async def process_custom_date(message: types.Message, state: FSMContext):
     ])
     
     if target_type == "user":
-        supupdate({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", target_id).execute()
+        supabase.table("users").update({"status": "approved", "valid_until": valid_until, "expiry_notified": False}).eq("id", target_id).execute()
         try: await bot.send_message(target_id, user_text, reply_markup=user_kb)
         except Exception as e: logger.warning(f"Could not send term notify to {target_id}: {e}")
         
@@ -782,10 +782,9 @@ async def cmd_ping(message: types.Message):
         db_status = "🔴 Ошибка"
         
     end = time.perf_counter()
-    ping_ms = round((end - start.id) * 1000)
+    ping_ms = round((end - start) * 1000)
     
-    await, message.answer(f"🏓 <b>Понг!</b text>\nСервер: 🟢 Работает)
-       \nБаза except данных: {db_status}\nЗадержка: <b>{ping_ms} мс</b>")
+    await message.answer(f"🏓 <b>Понг!</b>\nСервер: 🟢 Работает\nБаза данных: {db_status}\nЗадержка: <b>{ping_ms} мс</b>")
 
 @dp.message(Command("status"))
 async def cmd_user_status(message: types.Message):
@@ -842,7 +841,8 @@ async def on_business_connection(conn: types.BusinessConnection):
             "Все сохранённые данные доступны в приложении «Глазок»."
         )
         try:
-            await bot.send_message(conn.user Exception as e:
+            await bot.send_message(conn.user.id, text)
+        except Exception as e:
             logger.error(f"Failed to send business connection notify: {e}")
     else:
         try:
